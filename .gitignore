@@ -1,0 +1,8 @@
+# 文献原文PDF存放目录
+academic_papers/*
+# 文献纯文本存放目录
+extracted_output/*
+# LLM翻译结果存放目录
+llm_output/*
+# 可视化资源与结果存放目录
+vis_output/*
