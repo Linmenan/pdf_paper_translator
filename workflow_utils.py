@@ -44,12 +44,12 @@ SYSTEM_PROMPT_BODY = """
 **核心规则:**
 1. **风格**: 保持学术论文的严谨、客观、逻辑性。
 2. **结构**: 
-   - 章节标题 -> <header>译文</header>
+   - 章节标题 [[HEADER: 3. Title AlphaDrive]] -> <header>3. 标题 AlphaDrive </header>
    - 正文段落 -> <p>译文</p>
 3. **引用**: 遇到文中引用 (如 "Figure 1", "Eq. 2")，必须根据 Map 格式化为 `[[LINK: ID|原文]]`。
    - 示例: "As shown in Fig. 1" -> "如图 [[LINK: Figure_1|Fig. 1]] 所示"
 4. **禁止**: 绝对不要输出 <src> 原文标签。只输出译文。
-5. **保留**: 请保留原文中的引用标记（如 [1], [1-5]），不要修改其格式。
+5. **保留**: 某些驼峰格式的专有名词、缩写保留原文，请保留原文中的引用标记（如 [1], [1-5]），不要修改其格式。
 """
 
 # --- 场景 C: 资源说明专用 (图表/算法描述) ---
@@ -936,16 +936,12 @@ def split_text_into_chunks(text, max_chars):
                 
     return final_chunks
 
-# --- HTML 生成器 (完整版：含 CSS 美化与引用正则匹配) ---
+# --- HTML 生成器 (最终增强版：修复标题漏网、公式丢失、图表错位) ---
 def generate_html_report(llm_result_path: str, paper_vis_dir: str):
-    # 1. 确定路径
-    # 优先读取 JSON 缓存，因为包含结构化的 src 和 trans
+    # 1. 路径准备
     cache_path = llm_result_path.replace("_llm_result.txt", "_llm_cache.json")
-    
     if not os.path.exists(cache_path):
-        # 如果 JSON 不存在，尝试回退到读取 txt (兼容旧逻辑，但推荐用 json)
-        print(f"⚠️ 警告：未找到缓存文件 {cache_path}，尝试仅使用文本结果（可能丢失对齐）。")
-        return "Error: Cache JSON not found."
+        return "Error: 找不到缓存文件，无法执行高级可视化。"
 
     raw_name = os.path.basename(paper_vis_dir)
     html_path = os.path.join(paper_vis_dir, f"{raw_name}_Report.html")
@@ -955,182 +951,305 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
         with open(cache_path, 'r', encoding='utf-8') as f:
             cache_data = json.load(f)
     except Exception as e:
-        return f"读取缓存失败: {e}"
+        return f"JSON 读取失败: {e}"
 
     tasks = cache_data.get("tasks", [])
     raw_refs = cache_data.get("raw_references", "")
 
-    # --- 通用正则：匹配参考文献索引 [1], [1,2], [1-5], [10, 12-14] ---
-    # 说明：
-    # \[        : 左中括号
-    # \s* : 允许空格
-    # \d+       : 数字
-    # (?: ...)* : 非捕获组，匹配后续的 ", 2" 或 "-5" 或 "~8"
-    # [\s,\-~]+ : 分隔符
-    # \]        : 右中括号
-    citation_pattern = r'(\[\s*\d+(?:[\s,\-~]+\d+)*\s*\])'
+    # ==========================================================================
+    # 1. 数据预处理：任务分类
+    # ==========================================================================
+    meta_task = None
+    asset_task = None
+    body_tasks = []
 
-    # --- 内部渲染函数：处理左侧原文 ---
-    def render_src(text):
+    for t in tasks:
+        if t['type'] == 'meta': meta_task = t
+        elif t['type'] == 'asset': asset_task = t
+        else: body_tasks.append(t)
+
+    # ==========================================================================
+    # 2. 核心逻辑：构建资源字典 (Assets Map)
+    # ==========================================================================
+    assets_map = {}
+    
+    if asset_task:
+        src_full = asset_task.get('src', '')
+        trans_full = asset_task.get('trans', '')
+        
+        # A. 处理带标题的资源 (Caption)
+        src_iter = re.finditer(r'\[\[ASSET_CAPTION:\s*(.*?)\s*\|\s*(.*?)\]\]', src_full, re.DOTALL)
+        for m in src_iter:
+            aid = m.group(1).strip()
+            src_txt = m.group(2).strip()
+            
+            # 尝试在译文中找对应的 <asset id="AID">...</asset>
+            # 修复：使用更宽松的正则，防止 LLM 改写 ID
+            trans_match = re.search(fr'<asset id=["\']?{re.escape(aid)}["\']?>(.*?)</asset>', trans_full, re.DOTALL)
+            trans_txt = trans_match.group(1).strip() if trans_match else "(未找到译文)"
+            
+            assets_map[aid] = {
+                "id": aid,
+                "type": "captioned",
+                "src": src_txt,
+                "trans": trans_txt,
+                "path": f"{assets_rel_path}/{aid}.png"
+            }
+            
+        # B. 【修复公式丢失】处理仅占位符的资源 (Placeholder)
+        # 例如公式、无标题的算法图
+        ph_iter = re.finditer(r'\[\[ASSET_PLACEHOLDER:\s*(.*?)\]\]', src_full)
+        for m in ph_iter:
+            aid = m.group(1).strip()
+            # 如果这个 ID 还没被上面的 Caption 处理过，就加进去
+            if aid not in assets_map:
+                assets_map[aid] = {
+                    "id": aid,
+                    "type": "placeholder", # 标记为无标题
+                    "src": "",
+                    "trans": "",
+                    "path": f"{assets_rel_path}/{aid}.png"
+                }
+
+    # ==========================================================================
+    # 3. 渲染辅助函数
+    # ==========================================================================
+    
+    def clean_xml_and_headers(text):
+        """清洗 LLM 输出，并强制修复标题格式"""
         if not text: return ""
         
-        # 1. 基础 HTML 转义
-        html = text \
-            .replace("<", "&lt;").replace(">", "&gt;") \
-            .replace("\n", "<br>")
-        
-        # 2. 高亮 Header 和 Meta
-        html = re.sub(r'\[\[HEADER:\s*(.*?)\]\]', r'<div class="tag-header">\1</div>', html)
-        html = re.sub(r'\[\[META_(.*?):\s*(.*?)\]\]', r'<div class="tag-meta">[\1] \2</div>', html)
-        
-        # 3. 处理资源占位符与说明
-        html = re.sub(r'\[\[ASSET_PLACEHOLDER:\s*(.*?)\]\]', 
-                      fr'<div class="tag-asset">[资源占位: \1]</div><img src="{assets_rel_path}/\1.png" class="mini-img">', html)
-        
-        def asset_cap_sub(m):
-            aid, txt = m.group(1), m.group(2)
-            return f'<div class="tag-asset-cap">[资源说明: {aid}]</div><div class="src-cap">{txt}</div><img src="{assets_rel_path}/{aid}.png" class="full-img">'
-        html = re.sub(r'\[\[ASSET_CAPTION:\s*(.*?)\s*\|\s*(.*?)\]\]', asset_cap_sub, html)
-        
-        # 4. 【新增】高亮参考文献引用
-        html = re.sub(citation_pattern, r'<span class="citation-mark">\1</span>', html)
-        
-        return html
-
-    # --- 内部渲染函数：处理右侧译文 ---
-    def render_trans(text):
-        if not text: return "..."
-        if "FAILED" in text: return '<span style="color:red;">翻译失败</span>'
-        
-        # 1. 移除 LLM 可能残留的 markdown
+        # 1. 基础清洗
         text = re.sub(r'^```xml', '', text).replace('```', '')
         
-        # 2. 解析伪 XML 标签 -> HTML
-        text = re.sub(r'<header>(.*?)</header>', r'<h3 class="trans-header">\1</h3>', text, flags=re.DOTALL)
-        text = re.sub(r'<meta_title>(.*?)</meta_title>', r'<h1 class="trans-title">\1</h1>', text, flags=re.DOTALL)
-        text = re.sub(r'<meta_author>(.*?)</meta_author>', r'<div class="trans-author">\1</div>', text, flags=re.DOTALL)
-        text = re.sub(r'<p>(.*?)</p>', r'<p class="trans-p">\1</p>', text, flags=re.DOTALL)
-        text = re.sub(r'<asset id=["\'](.*?)["\']>(.*?)</asset>', r'<div class="trans-asset-box"><b>图表 \1:</b> \2</div>', text, flags=re.DOTALL)
+        # 2. 【修复标题漏网】处理 [[HEADER:...]] 没被翻译成 XML 的情况
+        # 只要看到 [[HEADER: ...]]，就强行转为无标签文本，但在外部会被 row_class 捕获变蓝
+        text = re.sub(r'\[\[HEADER:\s*(.*?)\]\]', r'\1', text)
         
-        # 3. 处理跳转链接 Link
-        text = re.sub(r'\[\[LINK:\s*([^\|]+)\|(.*?)\]\]', r'<a href="#\1" class="ref-link">\2</a>', text)
+        # 3. 处理标准 XML 标签
+        text = text.replace('<header>', '').replace('</header>', '') 
+        text = text.replace('<p>', '').replace('</p>', '<br>')
         
-        # 4. 【新增】高亮参考文献引用
-        text = re.sub(citation_pattern, r'<span class="citation-mark">\1</span>', text)
+        # 4. 处理 Link
+        text = re.sub(r'\[\[LINK:\s*([^\|]+)\|(.*?)\]\]', r'<a href="#\1" class="internal-link">\2</a>', text)
+        
+        # 5. 处理参考文献引用
+        def ref_sub(m):
+            full_str = m.group(1) 
+            first_num = re.search(r'\d+', full_str)
+            if first_num:
+                return f'<a href="#ref-{first_num.group(0)}" class="citation-mark">{full_str}</a>'
+            return f'<span class="citation-mark">{full_str}</span>'
+        text = re.sub(r'(\[\s*\d+(?:[\s,\-~]+\d+)*\s*\])', ref_sub, text)
         
         return text
 
-    # --- 构建主 HTML 内容 ---
-    rows_html = ""
-    for task in tasks:
-        src_html = render_src(task.get('src', ''))
-        trans_html = render_trans(task.get('trans', ''))
+    # ==========================================================================
+    # 4. 组装 HTML
+    # ==========================================================================
+
+    # --- Part A: Meta ---
+    html_meta = ""
+    if meta_task:
+        m_src = meta_task.get('src', '')
+        m_trans = meta_task.get('trans', '')
         
-        row_class = "normal-row"
-        if "[[HEADER:" in task.get('src', ''): row_class = "header-row-bg"
+        t_en = re.search(r'\[\[META_TITLE:(.*?)\]\]', m_src, re.DOTALL)
+        t_en = t_en.group(1).strip() if t_en else ""
         
-        rows_html += f"""
-        <div class="chunk-row {row_class}">
-            <div class="col-src">{src_html}</div>
-            <div class="col-trans">{trans_html}</div>
+        a_en = re.search(r'\[\[META_AUTHOR:(.*?)\]\]', m_src, re.DOTALL)
+        a_en = a_en.group(1).strip() if a_en else ""
+        
+        t_zh = re.search(r'<meta_title>(.*?)</meta_title>', m_trans, re.DOTALL)
+        t_zh = t_zh.group(1).strip() if t_zh else ""
+        
+        a_zh = re.search(r'<meta_author>(.*?)</meta_author>', m_trans, re.DOTALL)
+        a_zh = a_zh.group(1).strip() if a_zh else ""
+        
+        html_meta = f"""
+        <div class="meta-section">
+            <h1 class="meta-title-en">{t_en}</h1>
+            <h1 class="meta-title-zh">{t_zh}</h1>
+            <div class="meta-author-en">{a_en}</div>
+            <div class="meta-author-zh">{a_zh}</div>
         </div>
+        <hr class="meta-divider">
         """
 
-    # --- 处理参考文献部分 ---
-    refs_html = ""
-    if raw_refs:
-        # 简单的格式化：换行转 <br>，并也应用引用高亮
-        clean_refs = raw_refs.replace('\n', '<br>')
-        clean_refs = re.sub(r'^(\[\d+\])', r'<b class="ref-id">\1</b>', clean_refs, flags=re.MULTILINE)
+    # --- Part B: Body (含资源插入) ---
+    html_body = ""
+    placed_assets = set()
+    
+    for task in body_tasks:
+        src_txt = task.get('src', '')
+        trans_txt = task.get('trans', '')
         
-        refs_html = f"""
-        <div class="chunk-row ref-row">
-            <div class="col-src">
-                <h3 style="color:#2c3e50; border-bottom:2px solid #eee; padding-bottom:10px;">References (Original)</h3>
-                <div class="ref-content">{clean_refs}</div>
-            </div>
-            <div class="col-trans">
-                <h3 style="color:#2c3e50; border-bottom:2px solid #eee; padding-bottom:10px;">参考文献</h3>
-                <div style="color:#7f8c8d; padding:20px; text-align:center; background:#f9f9f9;">
-                    (参考文献通常保留原文以供精确检索，未进行翻译)
+        # 判断是否为标题行 (兼容 [[HEADER:]] 和 <header>)
+        is_header_src = "[[HEADER:" in src_txt
+        is_header_trans = "[[HEADER:" in trans_txt or "<header>" in trans_txt
+        
+        row_class = "header-row" if (is_header_src or is_header_trans) else "text-row"
+        
+        # 清洗
+        display_src = re.sub(r'\[\[HEADER:\s*(.*?)\]\]', r'\1', src_txt)
+        display_src = re.sub(r'(\[\s*\d+(?:[\s,\-~]+\d+)*\s*\])', r'<span class="citation-mark-src">\1</span>', display_src)
+        
+        display_trans = clean_xml_and_headers(trans_txt)
+        
+        # 生成行
+        html_body += f"""
+        <div class="row {row_class}">
+            <div class="col-src">{display_src}</div>
+            <div class="col-trans">{display_trans}</div>
+        </div>
+        """
+        
+        # --- 资源插入逻辑 ---
+        # 查找引用 [[LINK: ID | ...]]
+        mentions = re.findall(r'\[\[LINK:\s*([^\|]+)\|', src_txt)
+        for mid in mentions:
+            if mid in assets_map and mid not in placed_assets:
+                asset = assets_map[mid]
+                
+                # 根据资源类型渲染不同样式
+                if asset["type"] == "placeholder": # 公式/纯图
+                    asset_html = f"""
+                    <div class="row asset-row" id="{mid}">
+                        <div class="asset-card placeholder-card">
+                            <div class="asset-header-mini">{mid}</div>
+                            <img src="{asset['path']}" class="asset-img-raw" loading="lazy">
+                        </div>
+                    </div>
+                    """
+                else: # 带标题的图表
+                    asset_html = f"""
+                    <div class="row asset-row" id="{mid}">
+                        <div class="asset-card">
+                            <div class="asset-header"><span class="asset-tag">Resource</span> {mid}</div>
+                            <img src="{asset['path']}" class="asset-img" loading="lazy">
+                            <div class="asset-desc-box">
+                                <div class="asset-desc-en">{asset['src']}</div>
+                                <div class="asset-desc-zh">{asset['trans']}</div>
+                            </div>
+                        </div>
+                    </div>
+                    """
+                
+                html_body += asset_html
+                placed_assets.add(mid)
+
+    # 兜底：未引用的资源
+    remaining = [k for k in assets_map.keys() if k not in placed_assets]
+    if remaining:
+        html_body += '<div class="row"><div style="width:100%; text-align:center; color:#999; padding:20px;">--- 附录资源 ---</div></div>'
+        for mid in remaining:
+            asset = assets_map[mid]
+            # 简化渲染
+            html_body += f"""
+            <div class="row asset-row" id="{mid}">
+                <div class="asset-card">
+                    <div class="asset-header">{mid}</div>
+                    <img src="{asset['path']}" class="asset-img" loading="lazy">
+                    <div class="asset-desc-box">
+                        <div class="asset-desc-en">{asset['src']}</div>
+                        <div class="asset-desc-zh">{asset['trans']}</div>
+                    </div>
                 </div>
             </div>
-        </div>
-        """
+            """
 
-    # --- 完整的 HTML 模板 (含 CSS) ---
-    html_template = f"""<!DOCTYPE html>
+    # --- Part C: Refs ---
+    html_refs = ""
+    if raw_refs:
+        refs_content = re.sub(r'\[\[HEADER:.*?\]\]', '', raw_refs).strip()
+        ref_entries = re.split(r'\[(\d+)\]', refs_content)
+        
+        ref_items = ""
+        for i in range(1, len(ref_entries), 2):
+            rid = ref_entries[i]
+            rtext = ref_entries[i+1].strip()
+            ref_items += f"""
+            <div class="ref-item" id="ref-{rid}">
+                <div class="ref-id">[{rid}]</div>
+                <div class="ref-text">{rtext}</div>
+            </div>
+            """
+        html_refs = f"""<div class="ref-section"><h2 class="ref-title">References</h2><div class="ref-list">{ref_items}</div></div>"""
+
+    # --- Final HTML ---
+    full_html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>{raw_name} - 双语对照报告</title>
+    <title>{raw_name}</title>
     <style>
-        :root {{ --bg: #f4f7f6; --border: #e0e0e0; --primary: #2c3e50; --link-color: #3498db; }}
-        body {{ font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: var(--bg); color: #333; }}
-        .container {{ max-width: 96%; margin: 30px auto; background: #fff; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-radius: 8px; overflow: hidden; }}
+        :root {{ --primary: #2c3e50; --accent: #3498db; --bg: #f8f9fa; --border: #e0e0e0; --header-bg: #eef6fc; --header-text: #2980b9; }}
+        body {{ font-family: "Segoe UI", Roboto, "Microsoft YaHei", sans-serif; margin: 0; background: var(--bg); color: #333; line-height: 1.6; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background: #fff; box-shadow: 0 0 20px rgba(0,0,0,0.05); }}
         
-        /* 布局网格 */
-        .chunk-row {{ display: flex; border-bottom: 1px solid var(--border); }}
-        .chunk-row:last-child {{ border-bottom: none; }}
-        .chunk-row:hover {{ background-color: #fafafa; transition: background 0.2s; }}
+        /* Meta */
+        .meta-section {{ padding: 40px; text-align: center; background: #fff; }}
+        .meta-title-en {{ font-size: 1.8em; color: #2c3e50; margin-bottom: 10px; font-weight: 700; }}
+        .meta-title-zh {{ font-size: 1.6em; color: #34495e; margin-top: 0; margin-bottom: 20px; font-weight: 400; }}
+        .meta-author-en {{ font-size: 1em; color: #7f8c8d; font-style: italic; }}
+        .meta-author-zh {{ font-size: 1em; color: #16a085; font-weight: bold; margin-top: 5px; }}
+        .meta-divider {{ border: 0; border-top: 1px solid #eee; margin: 0; }}
+
+        /* Grid */
+        .row {{ display: flex; border-bottom: 1px solid var(--border); }}
+        .col-src {{ flex: 1; padding: 20px; border-right: 1px solid var(--border); color: #555; font-family: "Cambria", serif; font-size: 15px; background: #fff; }}
+        .col-trans {{ flex: 1; padding: 20px; color: #111; font-size: 16px; background: #fdfdfd; }}
         
-        .col-src {{ flex: 1; padding: 25px; border-right: 1px solid var(--border); font-family: "Cambria", serif; color: #444; font-size: 15px; line-height: 1.6; overflow-x: auto; background: #fff; }}
-        .col-trans {{ flex: 1; padding: 25px; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #111; font-size: 16px; line-height: 1.7; background: #fcfcfc; }}
+        /* Header */
+        .header-row {{ background-color: var(--header-bg) !important; border-bottom: 2px solid #d6eaf8; }}
+        .header-row .col-src, .header-row .col-trans {{ font-weight: bold; color: var(--header-text); font-size: 1.2em; background: transparent; }}
+
+        /* Assets */
+        .asset-row {{ display: block; background: #f4f4f4; padding: 20px; border-bottom: 1px solid #ddd; }}
+        .asset-card {{ background: #fff; max-width: 90%; margin: 0 auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); overflow: hidden; }}
+        .placeholder-card {{ max-width: 60%; }} /* 公式卡片窄一点 */
         
-        /* 标题与元数据样式 */
-        .header-row-bg {{ background-color: #f0f8ff; }}
-        .tag-header {{ font-weight: 800; color: #2980b9; font-size: 1.1em; margin-bottom: 8px; display: inline-block; background: rgba(41,128,185,0.1); padding: 2px 8px; border-radius: 4px; }}
-        .tag-meta {{ color: #16a085; font-size: 0.85em; margin-bottom: 4px; font-family: monospace; }}
+        .asset-header {{ background: #f8f9fa; padding: 10px 20px; font-weight: bold; color: #555; border-bottom: 1px solid #eee; }}
+        .asset-header-mini {{ background: #f8f9fa; padding: 5px 15px; font-size: 0.9em; color: #888; border-bottom: 1px solid #eee; }}
         
-        .trans-header {{ color: #2980b9; margin-top: 0; font-size: 1.4em; border-bottom: 1px solid #eee; padding-bottom: 10px; }}
-        .trans-title {{ color: #2c3e50; text-align: center; font-size: 2em; margin: 20px 0; }}
-        .trans-author {{ color: #16a085; text-align: center; margin-bottom: 30px; font-weight: bold; font-size: 1.1em; }}
-        .trans-p {{ margin-bottom: 15px; text-align: justify; text-justify: inter-ideograph; }}
+        .asset-tag {{ background: #3498db; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; margin-right: 5px; }}
+        .asset-img {{ display: block; max-width: 100%; max-height: 600px; margin: 0 auto; }}
+        .asset-img-raw {{ display: block; max-width: 100%; margin: 10px auto; }}
         
-        /* 资源图片样式 */
-        .tag-asset {{ background: #f0f0f0; padding: 2px 6px; font-size: 0.8em; color: #888; border-radius: 4px; }}
-        .tag-asset-cap {{ background: #fff3cd; color: #856404; padding: 2px 6px; font-size: 0.8em; font-weight: bold; border-radius: 4px; margin-bottom: 5px; display:inline-block; }}
-        .src-cap {{ font-style: italic; color: #666; margin-bottom: 10px; }}
-        .mini-img {{ max-height: 40px; display: block; margin: 5px 0; opacity: 0.5; border: 1px solid #eee; }}
-        .full-img {{ max-width: 98%; border: 1px solid #eee; margin: 10px auto; display: block; box-shadow: 0 2px 5px rgba(0,0,0,0.05); border-radius: 4px; }}
+        .asset-desc-box {{ padding: 20px; background: #fffdf5; border-top: 1px solid #eee; }}
+        .asset-desc-en {{ font-style: italic; color: #666; margin-bottom: 10px; font-size: 0.95em; border-bottom: 1px dashed #ddd; padding-bottom: 8px; }}
+        .asset-desc-zh {{ font-weight: 500; color: #2c3e50; }}
+
+        /* Refs */
+        .ref-section {{ padding: 40px; background: #fff; border-top: 4px solid #2c3e50; }}
+        .ref-title {{ text-align: center; color: #2c3e50; margin-bottom: 30px; }}
+        .ref-list {{ display: grid; grid-template-columns: 1fr; gap: 15px; }}
+        .ref-item {{ display: flex; align-items: flex-start; }}
+        .ref-id {{ min-width: 40px; font-weight: bold; color: #e74c3c; text-align: right; margin-right: 15px; }}
+        .ref-text {{ font-size: 0.95em; color: #555; word-break: break-word; }}
+
+        /* Inline */
+        .citation-mark {{ color: #e74c3c; font-weight: bold; cursor: pointer; background: rgba(231, 76, 60, 0.1); padding: 0 2px; border-radius: 2px; font-size: 0.9em; }}
+        .citation-mark-src {{ color: #999; font-size: 0.9em; }}
+        .internal-link {{ color: #3498db; text-decoration: none; font-weight: 500; background: rgba(52,152,219,0.1); padding: 0 4px; border-radius: 3px; }}
+        .internal-link:hover {{ background: rgba(52,152,219,0.2); text-decoration: underline; }}
         
-        .trans-asset-box {{ background: #fffdf5; padding: 15px; border-left: 4px solid #f1c40f; margin: 15px 0; border-radius: 0 4px 4px 0; font-size: 0.95em; color: #555; }}
-        
-        /* 链接与引用样式 (核心修改) */
-        .ref-link {{ color: var(--link-color); text-decoration: none; background: rgba(52,152,219,0.1); padding: 0 4px; border-radius: 3px; font-weight: 500; }}
-        .ref-link:hover {{ text-decoration: underline; background: rgba(52,152,219,0.2); }}
-        
-        .citation-mark {{ 
-            color: #d35400; /* 橙褐色 */
-            font-weight: bold;
-            font-size: 0.9em;
-            background-color: rgba(230, 126, 34, 0.12);
-            padding: 0 3px;
-            border-radius: 3px;
-            cursor: help; /* 鼠标变成问号，提示可关注 */
-            margin: 0 1px;
-        }}
-        .citation-mark:hover {{ 
-            background-color: rgba(230, 126, 34, 0.3); 
-            color: #c0392b;
-        }}
-        
-        /* 参考文献列表区 */
-        .ref-id {{ color: #c0392b; font-weight: bold; margin-right: 5px; }}
-        .ref-content {{ font-size: 0.9em; color: #555; line-height: 1.8; }}
-        
+        /* Anchor Highlight */
+        :target {{ scroll-margin-top: 20px; animation: highlight 2s ease; }}
+        @keyframes highlight {{ 0% {{ background-color: #fff3cd; }} 100% {{ background-color: transparent; }} }}
     </style>
 </head>
 <body>
     <div class="container">
-        {rows_html}
-        {refs_html}
+        {html_meta}
+        <div class="main-content">{html_body}</div>
+        {html_refs}
     </div>
 </body>
 </html>"""
 
     try:
-        with open(html_path, 'w', encoding='utf-8') as f: f.write(html_template)
+        with open(html_path, 'w', encoding='utf-8') as f: f.write(full_html)
         return html_path
     except Exception as e:
-        return f"写入HTML文件失败: {e}"
+        return f"HTML 写入失败: {e}"
