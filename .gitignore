@@ -6,3 +6,4 @@ extracted_output/*
 llm_output/*
 # 可视化资源与结果存放目录
 vis_output/*
+.env
