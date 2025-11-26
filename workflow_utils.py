@@ -472,17 +472,20 @@ def smart_merge_paragraphs(blocks, max_split_len=500):
 
 # --- 核心提取逻辑 ---
 def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_output_root: str) -> tuple[str, str, str, int]:
-    # 注意：vis_output_root 参数虽然传入，但在此函数中主要用于返回路径，
-    # 实际图片保存路径改为 raw_text_dir (即 extracted_output) 下的 assets
-    
     if not os.path.exists(pdf_path): raise FileNotFoundError(f"PDF missing: {pdf_path}")
     
     clean_name = sanitize_filename(pdf_path)
     os.makedirs(raw_text_dir, exist_ok=True)
+    
+    # 文本文件维持在 extracted_output 根目录下，保持与 Notebook 配置兼容
     txt_path = os.path.join(raw_text_dir, f"{clean_name}_context.txt")
     
-    # --- 修改点：资源保存在 extracted_output 下 ---
-    extracted_assets_dir = os.path.join(raw_text_dir, "assets")
+    # --- 【修改点 1】资源隔离 ---
+    # 旧路径: os.path.join(raw_text_dir, "assets") -> 导致混淆
+    # 新路径: os.path.join(raw_text_dir, clean_name, "assets") -> 按文章名隔离
+    extracted_assets_dir = os.path.join(raw_text_dir, clean_name, "assets")
+    
+    # 清理旧数据 (只清理当前文章的 assets)
     if os.path.exists(extracted_assets_dir): shutil.rmtree(extracted_assets_dir)
     os.makedirs(extracted_assets_dir, exist_ok=True)
 
@@ -499,7 +502,7 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
     verified_data = editor.data
 
     # 3. 资源聚合 & 元数据提取
-    print("🧩 正在处理元数据与资源...")
+    print(f"🧩 正在处理资源 (保存至: {extracted_assets_dir})...")
     assets_agg = {}
     meta_info_blocks = [] 
     
@@ -547,7 +550,7 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
                 merged_img.paste(img, (0, y_off))
                 y_off += img.height
             
-            # 保存到 extracted_output/assets
+            # --- 【修改点 2】保存到隔离目录 ---
             merged_img.save(os.path.join(extracted_assets_dir, f"{key}.png"))
             asset_count += 1
         
@@ -561,16 +564,15 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
 
     ref_map_str = "\n".join(ref_map)
 
-    # 5. 正文提取 (核心：插入 [[ASSET_INSERT]])
-    print("📝 提取正文文本 (含物理位置标记)...")
+    # 5. 正文提取 (含物理位置标记)
+    print("📝 提取正文文本...")
     raw_paragraph_stream = [] 
     raw_paragraph_stream.extend(meta_info_blocks)
     
     header_pattern = re.compile(r'^(\d+(\.\d+)*\.?|[IVX]+\.|[A-Z]\.)\s+|^(Abstract|References|Introduction|Conclusion|Method)', re.IGNORECASE)
 
     for p_idx, page in enumerate(doc):
-        # A. 收集本页需要插入的 Asset Insert 标记
-        # 我们使用 Asset 的 rect.y0 (顶部位置) 来决定插入点
+        # A. 收集本页 Asset Insert 标记
         page_asset_inserts = []
         page_items = verified_data.get(p_idx, [])
         ignore_rects = []
@@ -582,21 +584,15 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
             elif item['type'] in ['Mask', 'Title', 'Author']: 
                 ignore_rects.append(item['rect'])
             else:
-                # 这是一个 Asset，添加到 ignore 列表，并准备插入标记
                 ignore_rects.append(item['rect'])
-                # 只在第一个片段(通常是 Body)处插入一次
-                # 为了防止重复插入(如果一个Asset有Body又有Caption)，这里简单去重
                 key = f"{item['type']}_{item['id']}"
-                # 创建一个伪 Block，用于排序
-                # 格式: (x0, y0, x1, y1, text)
-                # 我们使用 y0 来排序
                 page_asset_inserts.append({
                     "rect": item['rect'],
                     "text": f"[[ASSET_INSERT: {key}]]",
                     "id": key
                 })
 
-        # 去重：每个 Key 只保留一个插入点 (取 y0 最小的那个，即最上面的)
+        # 去重
         unique_inserts = {}
         for ins in page_asset_inserts:
             k = ins['id']
@@ -606,12 +602,7 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
 
         # B. 获取文本块
         raw_blocks = page.get_text("blocks", clip=content_rect)
-        
-        # 将 text blocks 转换为统一格式字典以便混合排序
-        # PyMuPDF block: (x0, y0, x1, y1, "lines\n", block_no, block_type)
         mixed_blocks = []
-        
-        # 左右分栏排序逻辑
         mid_x = (content_rect.x0 + content_rect.x1) / 2
         left_col, right_col = [], []
         for b in raw_blocks:
@@ -624,8 +615,6 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
         for b in sorted_text_blocks:
             bbox = fitz.Rect(b[:4])
             text = b[4].strip()
-            
-            # 检查是否被 Mask
             is_masked = False
             for ir in ignore_rects:
                 if is_box_in_rect(bbox, ir, 0.6): 
@@ -634,11 +623,10 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
             if not is_masked and text:
                 mixed_blocks.append({
                     "type": "text",
-                    "y_sort": bbox.y0 + (0 if bbox.x0 < mid_x else 10000), # 简单的分栏排序权值
+                    "y_sort": bbox.y0 + (0 if bbox.x0 < mid_x else 10000),
                     "text": text
                 })
 
-        # 将 Asset 标记插入混合列表
         for ins in sorted_inserts:
             bbox = ins['rect']
             mixed_blocks.append({
@@ -647,10 +635,8 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
                 "text": ins['text']
             })
             
-        # 混合排序 (主要靠 y_sort，也就是分栏后的垂直顺序)
         mixed_blocks.sort(key=lambda x: x['y_sort'])
 
-        # C. 输出到流
         for b in mixed_blocks:
             text = b['text']
             if b['type'] == "text":
@@ -664,13 +650,12 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
                 else:
                     raw_paragraph_stream.append(text)
             else:
-                # 这是一个 ASSET_INSERT 标记，直接加入流
                 raw_paragraph_stream.append(text)
 
     # 6. 合并
     merged_text_blocks = smart_merge_paragraphs(raw_paragraph_stream)
 
-    # 7. Metadata & Refs
+    # 7. Metadata
     assets_xml_snippets = []
     sorted_keys = sorted(assets_agg.keys(), key=lambda k: (k.split('_')[0], int(k.split('_')[1])))
     
@@ -688,8 +673,6 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
         f.write(f"[[REF_MAP_START]]\n{ref_map_str}\n[[REF_MAP_END]]\n\n")
         f.write(final_content)
 
-    # 返回 vis_output_root 供后续使用，虽然图片现在在 extracted_output
-    # 但最终 HTML 还是要在 vis_output 生成
     vis_final_dir = os.path.join(vis_output_root, clean_name)
     return final_content, txt_path, vis_final_dir, asset_count
 
