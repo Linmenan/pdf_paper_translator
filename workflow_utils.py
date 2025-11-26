@@ -30,9 +30,9 @@ SYSTEM_PROMPT_META = """
    - `[[META_AUTHOR: ...]]` -> 作者/机构信息
 2. **输出格式 (必须严格遵守 XML)**:
    - <meta_title>中文标题</meta_title>
-   - <meta_author>中文作者/机构</meta_author>
+   - <meta_author>作者不需翻译/机构翻译</meta_author>
 3. **禁止**: 绝对不要输出原文，不要输出任何解释性文字，不要输出 markdown 代码块。
-4. **人名处理**: 如果作者是外国人名，建议保留英文或使用通用音译；机构名请翻译。
+4. **人名处理**: 作者不需翻译；机构名请翻译。
 """
 
 # --- 场景 B: 正文专用 (学术风格 + 引用处理) ---
@@ -44,12 +44,14 @@ SYSTEM_PROMPT_BODY = """
 **核心规则:**
 1. **风格**: 保持学术论文的严谨、客观、逻辑性。
 2. **结构**: 
-   - 章节标题 [[HEADER: 3. Title AlphaDrive]] -> <header>3. 标题 AlphaDrive </header>
-   - 正文段落 -> <p>译文</p>
-3. **引用**: 遇到文中引用 (如 "Figure 1", "Eq. 2")，必须根据 Map 格式化为 `[[LINK: ID|原文]]`。
-   - 示例: "As shown in Fig. 1" -> "如图 [[LINK: Figure_1|Fig. 1]] 所示"
+   - 当原文行首显式包含 `[[HEADER: ...]]` 标记，代表独立标题行时，使用 `<header>...</header>` 标签。
+   - **禁止**将正文中的列表项（如 "1)", "3)" 等）随意升级为 `<header>`。
+   - 正文段落 -> <p>译文</p> (也可以不加 p 标签，直接输出文本)。
+3. **引用链接 (Link)**: 
+   - 仅针对图表引用 (如 "Fig. 1", "Table 2", "Eq. 3", "Algorithm. 4") 使用 `[[LINK: ID|原文]]` 格式。
+   - **严格禁止**对参考文献引用 (如 "[1]", "[22]", "[1-5]") 添加链接。参考文献引用必须原样保留，如 `[22]`。
 4. **禁止**: 绝对不要输出 <src> 原文标签。只输出译文。
-5. **保留**: 某些驼峰格式的专有名词、缩写保留原文，请保留原文中的引用标记（如 [1], [1-5]），不要修改其格式。
+5. **保留**: 驼峰格式专有名词、缩写保留原文。
 """
 
 # --- 场景 C: 资源说明专用 (图表/算法描述) ---
@@ -367,17 +369,27 @@ class LayoutEditor:
         elif k in ['BackSpace', 'Left']: self.prev_page()
 
     def next_page(self):
+        # 1. 获取当前页的正文区域 (ContentArea)
         curr_content = next((x for x in self.data.get(self.current_page, []) if x['type'] == 'ContentArea'), None)
         next_idx = self.current_page + 1
         
         if next_idx < self.page_count:
-            if next_idx not in self.data: self.data[next_idx] = []
+            # 确保下一页的数据列表已初始化
+            if next_idx not in self.data: 
+                self.data[next_idx] = []
             
-            if curr_content:
+            # --- 【核心修复】智能继承逻辑 ---
+            # 检查下一页是否已经有了 ContentArea (例如从历史记录加载的)
+            next_has_content = any(x['type'] == 'ContentArea' for x in self.data[next_idx])
+            
+            # 只有当下一页【没有】正文区域时，才尝试继承当前页的
+            if not next_has_content and curr_content:
+                # 额外的智能检查：只有当页面尺寸一致时才继承，防止横页/竖页切换导致框跑飞
                 if self.doc[self.current_page].rect == self.doc[next_idx].rect:
-                     self.data[next_idx] = [x for x in self.data[next_idx] if x['type'] != 'ContentArea']
+                     # 复制一份当前页的框过去
                      self.data[next_idx].insert(0, curr_content.copy())
-
+            
+            # 翻页
             self.current_page += 1
             self.load_page()
         else:
@@ -392,16 +404,44 @@ class LayoutEditor:
 def split_long_buffer_safely(text, max_len):
     """
     将超长文本拆分为多个片段，确保拆分点在句子结束处。
+    修复：使用负向后瞻 (Negative Look-behind) 保护常见缩写 (Fig., Eq., al. 等) 不被切断。
     """
     if len(text) <= max_len:
         return [text]
     
-    # 正则解释：
-    # (?<=[.?!;]) : 前面必须是句号、问号、感叹号或分号
-    # \s+         : 中间有空格
-    # (?=[A-Z0-9]): 后面必须是大写字母或数字 (防止切断 e.g. 或 Fig. 1)
-    # 注意：这只是一个启发式规则，能覆盖绝大多数情况
-    sentences = re.split(r'(?<=[.?!;])\s+(?=[A-Z0-9])', text)
+    # --- 核心修改：保护缩写词的正则 ---
+    # 含义：
+    # 1. (?<!...) : 负向后瞻，如果句号前面是这些词，则不匹配
+    # 2. \b       : 单词边界，防止匹配到非单词结尾
+    # 3. (?<=[.?!;]) : 正向后瞻，必须以标点结尾
+    # 4. \s+      : 中间有空格
+    # 5. (?=[A-Z0-9]) : 后面接大写字母或数字
+    
+    protect_pattern = (
+        r'(?<!\bFig\.)(?<!\bFigs\.)'  # Fig. / Figs.
+        r'(?<!\bEq\.)(?<!\bEqs\.)'    # Eq. / Eqs.
+        r'(?<!\bTab\.)(?<!\bTabs\.)'  # Tab. / Tabs.
+        r'(?<!\bRef\.)(?<!\bRefs\.)'  # Ref. / Refs.
+        r'(?<!\bVol\.)(?<!\bno\.)'    # Vol. / no.
+        r'(?<!\bal\.)(?<!\bvs\.)'     # et al. / vs.
+        r'(?<!\bi\.e\.)(?<!\be\.g\.)' # i.e. / e.g.
+    )
+    
+    # 2. 切分逻辑：
+    # (?<=[.?!;]) : 必须以标点结尾
+    # \s+         : 分隔符是空格
+    # (?=[A-Z0-9\[]) : 后面接大写/数字/方括号(引用)
+    split_marker = r'(?<=[.?!;])\s+(?=[A-Z0-9\[])'
+    
+    final_pattern = protect_pattern + split_marker
+
+    try:
+        # 使用 IGNORECASE 以防 fig. 1
+        sentences = re.split(final_pattern, text, flags=re.IGNORECASE)
+    except re.error:
+        # 如果环境不支持复杂 lookbehind，回退到简单切分
+        print("⚠️ [Warning] Regex lookbehind failed, using simple split.")
+        sentences = re.split(r'(?<=[.?!;])\s+(?=[A-Z0-9])', text)
     
     chunks = []
     current_chunk = ""
@@ -427,41 +467,75 @@ def split_long_buffer_safely(text, max_len):
 def smart_merge_paragraphs(blocks, max_split_len=500):
     """
     blocks: 原始文本块流
-    max_split_len: 单个段落最大字符数
+    调试增强版：使用 repr() 显示不可见字符，强制打印 Fig 附近的匹配情况
     """
     if not blocks: return []
     merged = []
     buffer = ""
-    terminals = ('.', '?', '!', ':', ';', '。', '？', '！', '：', '；')
     
-    # 修改正则：增加 ASSET_INSERT 作为硬边界
+    terminals = ('.', '?', '!', ':', ';', '。', '？', '！', '：', '；')
     hard_boundary_pattern = re.compile(r'^\[\[(HEADER|ASSET_|META_).*?\]\]')
+    
+    # --- 调试用：放宽正则，先抓到再说 ---
+    # 移除 (?:^|\s) 限制，直接匹配结尾的关键词
+    hanging_abbrev_pattern = re.compile(
+        r'(Fig|Figure|Eq|Equation|Tab|Table|Ref|Reference|Sec|Section)\.?\s*$', 
+        re.IGNORECASE
+    )
 
-    for block in blocks:
+    print(f"🔍 [DEBUG] 开始处理 {len(blocks)} 个文本块...")
+
+    for i, block in enumerate(blocks):
         block = block.strip()
         if not block: continue
         
-        # 1. 遇到硬性边界 (Header, Meta, 或者 ASSET_INSERT) -> 强制刷新 Buffer
+        # 1. 硬性边界 -> 强制刷新
         if hard_boundary_pattern.match(block):
             if buffer:
                 merged.extend(split_long_buffer_safely(buffer, max_split_len))
                 buffer = ""
-            merged.append(block) # 这里的 block 可能是 [[ASSET_INSERT: Figure_1]]
+            merged.append(block)
             continue
         
-        # 2. 初始化 Buffer
+        # 2. 初始化
         if not buffer:
             buffer = block
             continue
             
-        # 3. 逻辑判定
+        # 3. 合并逻辑
         prev_end_char = buffer[-1] if buffer else ""
         
+        # --- 🕵️‍♂️ 显微镜调试区 ---
+        # 取 buffer 最后 20 个字符
+        tail = buffer[-20:]
+        # 如果结尾看起来像是 Fig，打印出来看看究竟是什么
+        if "Fig" in tail or "Tab" in tail:
+            is_match = hanging_abbrev_pattern.search(buffer) is not None
+            print(f"🧐 [Chunk {i}] 发现疑似缩写:")
+            print(f"   Buffer尾部(repr): {repr(tail)}") # <--- 重点看这里！
+            print(f"   正则匹配结果: {is_match}")
+            if not is_match:
+                print(f"   ⚠️ 警告：虽然包含关键字，但正则未匹配！")
+
+        # 情况 A: 连字符
         if prev_end_char == '-':
             buffer = buffer[:-1] + block
+            
+        # --- 情况 B: 悬挂缩写修复 ---
+        elif hanging_abbrev_pattern.search(buffer):
+            # print(f"🔗 [MERGE] 成功合并跨行缩写: ...{buffer[-10:]} + {block[:10]}...")
+            buffer = buffer + " " + block
+            
+        # 情况 C: 句子未结束
         elif (not buffer.endswith(terminals)) or (block[0].islower()):
             buffer = buffer + " " + block
+            
+        # 情况 D: 正常分段
         else:
+            # 调试：如果刚才 Fig 没匹配上，这里就会执行切分
+            if "Fig" in tail:
+                print(f"✂️ [SPLIT] 执行切分 (因为正则未匹配): ...{repr(tail)} || {repr(block[:10])}...")
+            
             merged.extend(split_long_buffer_safely(buffer, max_split_len))
             buffer = block 
 
@@ -476,32 +550,102 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
     
     clean_name = sanitize_filename(pdf_path)
     os.makedirs(raw_text_dir, exist_ok=True)
-    
-    # 文本文件维持在 extracted_output 根目录下，保持与 Notebook 配置兼容
     txt_path = os.path.join(raw_text_dir, f"{clean_name}_context.txt")
     
-    # --- 【修改点 1】资源隔离 ---
-    # 旧路径: os.path.join(raw_text_dir, "assets") -> 导致混淆
-    # 新路径: os.path.join(raw_text_dir, clean_name, "assets") -> 按文章名隔离
+    # 资源目录 (extracted_output/{PaperName}/assets)
     extracted_assets_dir = os.path.join(raw_text_dir, clean_name, "assets")
     
-    # 清理旧数据 (只清理当前文章的 assets)
-    if os.path.exists(extracted_assets_dir): shutil.rmtree(extracted_assets_dir)
-    os.makedirs(extracted_assets_dir, exist_ok=True)
+    # 标注配置文件路径
+    layout_config_path = os.path.join(raw_text_dir, clean_name, "layout_config.json")
+    
+    if not os.path.exists(os.path.dirname(layout_config_path)):
+        os.makedirs(os.path.dirname(layout_config_path), exist_ok=True)
 
     doc = fitz.open(pdf_path)
     
-    # 1. 初始化 LayoutEditor 数据
+    # =========================================================
+    # 1. 初始化数据 (核心修复：逐页合并历史与默认值)
+    # =========================================================
     init_data = {}
+    saved_json = {}
+
+    # 尝试读取历史文件
+    if os.path.exists(layout_config_path):
+        print(f"📂 检测到历史标注记录: {layout_config_path}，正在加载...")
+        try:
+            with open(layout_config_path, 'r', encoding='utf-8') as f:
+                saved_json = json.load(f)
+        except Exception as e:
+            print(f"⚠️ 加载历史记录失败 ({e})，将忽略历史文件。")
+            saved_json = {}
+
+    # 遍历每一页进行初始化
     for i, page in enumerate(doc):
         w, h = page.rect.width, page.rect.height
-        init_data[i] = [{'rect': fitz.Rect(0, h*0.08, w, h*0.92), 'type': 'ContentArea'}]
+        page_items = []
+        
+        # A. 尝试获取该页的历史数据
+        # JSON 的 key 是字符串类型的数字 "0", "1"...
+        if str(i) in saved_json:
+            raw_items = saved_json[str(i)]
+            for item in raw_items:
+                # 恢复 fitz.Rect 对象
+                r = item['rect'] # [x0, y0, x1, y1]
+                page_items.append({
+                    'rect': fitz.Rect(r[0], r[1], r[2], r[3]),
+                    'type': item['type'],
+                    'id': item['id'],
+                    'role': item['role']
+                })
+        
+        # B. 检查并补全 ContentArea (正文范围)
+        # 如果历史记录里没有这一页，或者这一页被删除了正文范围，必须补一个默认的
+        has_content_area = any(x['type'] == 'ContentArea' for x in page_items)
+        
+        if not has_content_area:
+            # 默认正文范围：页眉留 8% 空白
+            default_rect = fitz.Rect(0, h*0.08, w, h*0.92)
+            # 插入到列表头部，确保层级在最底层（虽然逻辑上不影响，但看着舒服）
+            page_items.insert(0, {
+                'rect': default_rect,
+                'type': 'ContentArea',
+                'id': 0,      # ID 对 ContentArea 无意义，给 0
+                'role': 'Body'
+            })
+            
+        init_data[i] = page_items
 
-    # 2. 交互校对
+    # =========================================================
+    # 2. 启动交互编辑器
+    # =========================================================
     editor = LayoutEditor(doc, init_data)
     verified_data = editor.data
 
-    # 3. 资源聚合 & 元数据提取
+    # =========================================================
+    # 3. 保存标注结果 (序列化)
+    # =========================================================
+    serializable_data = {}
+    for page_idx, items in verified_data.items():
+        serializable_data[page_idx] = []
+        for item in items:
+            r = item['rect']
+            serializable_data[page_idx].append({
+                'rect': [r.x0, r.y0, r.x1, r.y1],
+                'type': item['type'],
+                'id': item['id'],
+                'role': item['role']
+            })
+            
+    with open(layout_config_path, 'w', encoding='utf-8') as f:
+        json.dump(serializable_data, f, indent=2)
+    print(f"💾 标注进度已保存至: {layout_config_path}")
+
+    # =========================================================
+    # 4. 后续处理 (资源提取 & 文本生成)
+    # =========================================================
+    if os.path.exists(extracted_assets_dir): shutil.rmtree(extracted_assets_dir)
+    os.makedirs(extracted_assets_dir, exist_ok=True)
+
     print(f"🧩 正在处理资源 (保存至: {extracted_assets_dir})...")
     assets_agg = {}
     meta_info_blocks = [] 
@@ -534,7 +678,6 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
                 text = page.get_text("text", clip=item['rect']).strip().replace('\n', ' ')
                 assets_agg[key]['captions'].append(text)
 
-    # 4. Ref Map & 保存图片
     ref_map = [] 
     asset_count = 0
     final_asset_captions = {} 
@@ -550,7 +693,6 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
                 merged_img.paste(img, (0, y_off))
                 y_off += img.height
             
-            # --- 【修改点 2】保存到隔离目录 ---
             merged_img.save(os.path.join(extracted_assets_dir, f"{key}.png"))
             asset_count += 1
         
@@ -564,7 +706,6 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
 
     ref_map_str = "\n".join(ref_map)
 
-    # 5. 正文提取 (含物理位置标记)
     print("📝 提取正文文本...")
     raw_paragraph_stream = [] 
     raw_paragraph_stream.extend(meta_info_blocks)
@@ -572,11 +713,10 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
     header_pattern = re.compile(r'^(\d+(\.\d+)*\.?|[IVX]+\.|[A-Z]\.)\s+|^(Abstract|References|Introduction|Conclusion|Method)', re.IGNORECASE)
 
     for p_idx, page in enumerate(doc):
-        # A. 收集本页 Asset Insert 标记
         page_asset_inserts = []
         page_items = verified_data.get(p_idx, [])
         ignore_rects = []
-        content_rect = page.rect
+        content_rect = page.rect # 默认全页，会被下面的 ContentArea 覆盖
 
         for item in page_items:
             if item['type'] == 'ContentArea': 
@@ -592,7 +732,6 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
                     "id": key
                 })
 
-        # 去重
         unique_inserts = {}
         for ins in page_asset_inserts:
             k = ins['id']
@@ -600,7 +739,6 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
                 unique_inserts[k] = ins
         sorted_inserts = sorted(unique_inserts.values(), key=lambda x: x['rect'].y0)
 
-        # B. 获取文本块
         raw_blocks = page.get_text("blocks", clip=content_rect)
         mixed_blocks = []
         mid_x = (content_rect.x0 + content_rect.x1) / 2
@@ -652,10 +790,8 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
             else:
                 raw_paragraph_stream.append(text)
 
-    # 6. 合并
     merged_text_blocks = smart_merge_paragraphs(raw_paragraph_stream)
 
-    # 7. Metadata
     assets_xml_snippets = []
     sorted_keys = sorted(assets_agg.keys(), key=lambda k: (k.split('_')[0], int(k.split('_')[1])))
     
@@ -823,16 +959,13 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
     BASE_URL = "http://localhost:11434/v1"
     MODEL_NAME = "qwen2.5:7b"
     
-    # 导入 OpenAI
     from openai import OpenAI
 
-    # 1. 读取
     if os.path.isfile(full_text_path_or_content):
          with open(full_text_path_or_content, 'r', encoding='utf-8') as f: content = f.read()
     else:
         content = full_text_path_or_content
 
-    # 2. 预处理：分离 RefMap
     ref_map_str = ""
     body_text = content
     map_match = re.search(r'\[\[REF_MAP_START\]\]\n(.*?)\n\[\[REF_MAP_END\]\]', content, re.DOTALL)
@@ -840,39 +973,25 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
         ref_map_str = map_match.group(1)
         body_text = content.replace(map_match.group(0), "").strip()
     
-    # 3. 四段式切分
     meta_text, body_text, assets_text, raw_refs_text = split_content_smart(body_text)
     
-    # 4. 构建任务列表 (剥离 Layout Info)
     raw_chunks = []
-    # layout_map_global: 记录 { chunk_id_in_body_list: [asset_ids] }
     layout_map_global = {} 
     
-    if meta_text:
-        raw_chunks.append({"text": meta_text, "type": "meta"})
+    if meta_text: raw_chunks.append({"text": meta_text, "type": "meta"})
         
     if body_text:
-        # 使用新的切分函数，获取布局信息
         body_parts, local_layout_map = split_text_into_chunks_with_layout(body_text, MAX_CHUNK_CHARS)
-        
-        # 此时 raw_chunks 已有 1 个 meta (idx 0)
         offset = len(raw_chunks) 
-        
         for idx, part in enumerate(body_parts):
             raw_chunks.append({"text": part, "type": "body"})
-            
-            # 将 local layout (基于 body parts 的索引) 映射到 global layout (基于 raw_chunks 的索引)
             if idx in local_layout_map:
-                global_idx = idx + offset
-                layout_map_global[global_idx] = local_layout_map[idx]
+                layout_map_global[idx + offset] = local_layout_map[idx]
             
-    if assets_text:
-        raw_chunks.append({"text": assets_text, "type": "asset"})
+    if assets_text: raw_chunks.append({"text": assets_text, "type": "asset"})
 
-    # ---------------------------------------------------------
-    # 阶段一：任务编排
-    # ---------------------------------------------------------
-    print(f"📋 [阶段一] 编排任务: 总片段 {len(raw_chunks)} 个 | 策略: 分类型专用提示词")
+    # 阶段一
+    print(f"📋 [阶段一] 编排任务: 总片段 {len(raw_chunks)} 个")
     
     old_tasks_map = {}
     if cache_path and os.path.exists(cache_path):
@@ -884,117 +1003,128 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
         except: pass
 
     current_tasks = []
-    pending_count = 0
-    
     for i, item in enumerate(raw_chunks):
         c_text = item["text"]
         c_type = item["type"]
         h = compute_hash(c_text)
-        
         cached_task = old_tasks_map.get(h)
-        if cached_task and cached_task.get("status") == "success":
+        if cached_task:
             task_entry = cached_task
             task_entry["id"] = i
-            if "type" not in task_entry: task_entry["type"] = c_type 
-            print(f"   🔹 Part {i+1} [{c_type.upper()}]: 命中缓存")
+            if "type" not in task_entry: task_entry["type"] = c_type
+            if task_entry["status"] == "failed":
+                task_entry["status"] = "pending"
+                print(f"   🔹 Part {i+1}: 之前失败，已重置为 pending")
         else:
-            task_entry = {
-                "id": i,
-                "type": c_type,  
-                "chunk_hash": h,
-                "status": "pending",
-                "src": c_text, 
-                "trans": ""
-            }
-            pending_count += 1
-            
+            task_entry = { "id": i, "type": c_type, "chunk_hash": h, "status": "pending", "src": c_text, "trans": "" }
         current_tasks.append(task_entry)
 
-    # 保存 JSON (新增 layout_map)
-    cache_structure = {
-        "model": MODEL_NAME,
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "tasks": current_tasks,
-        "raw_references": raw_refs_text,
-        "layout_map": layout_map_global # 保存物理位置映射
-    }
+    # 阶段一点五：人工审查
+    suspicious_tasks = [t for t in current_tasks if t.get("status") == "suspicious"]
     
-    if cache_path:
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump(cache_structure, f, ensure_ascii=False, indent=2)
+    if suspicious_tasks:
+        print(f"\n⚠️ 检测到 {len(suspicious_tasks)} 个 'suspicious' 任务，请审核：")
+        for st in suspicious_tasks:
+            print("=" * 60)
+            print(f"【ID: {st['id']} | Type: {st['type']}】")
+            # --- 【修改点】完整显示，不再截断 ---
+            print("🔻 原文:")
+            print(st['src']) 
+            print("-" * 30)
+            print("🔻 译文:")
+            print(st['trans']) 
+            print("=" * 60)
             
-    if pending_count == 0:
-        print("🎉 所有任务已完成。")
-        # 直接返回，不重新生成 TXT，后续 HTML 生成依赖 JSON
-        return output_path
-
-    # ---------------------------------------------------------
-    # 阶段二：执行推理 (保持不变)
-    # ---------------------------------------------------------
-    print(f"\n🚀 [阶段二] 开始推理 (剩余 {pending_count} 个)...")
-    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-    
-    PROMPT_MAP = {
-        "meta": SYSTEM_PROMPT_META,
-        "body": SYSTEM_PROMPT_BODY.replace("{ref_map_str}", ref_map_str),
-        "asset": SYSTEM_PROMPT_ASSET.replace("{ref_map_str}", ref_map_str)
-    }
-    
-    for task in current_tasks:
-        if task["status"] == "success": continue
-            
-        idx = task["id"]
-        t_type = task["type"]
-        
-        # 打印预览
-        print(f"   ⚡ Part {idx+1}/{len(current_tasks)} [{t_type.upper()}] ...", end="", flush=True)
-        
-        current_sys_prompt = PROMPT_MAP.get(t_type, PROMPT_MAP["body"])
-        
-        messages = [
-            {"role": "system", "content": current_sys_prompt},
-            {"role": "user", "content": task["src"]}
-        ]
-        
-        success = False
-        for attempt in range(3):
-            try:
-                response = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=0.1,
-                    stream=False
-                )
-                res_text = response.choices[0].message.content
-                
-                # 清洗
-                res_text = re.sub(r'^```xml\s*', '', res_text)
-                res_text = re.sub(r'```$', '', res_text)
-                
-                if res_text:
-                    task["trans"] = res_text.strip()
-                    task["status"] = "success"
-                    print(" ✅")
-                    success = True
+            while True:
+                user_choice = input("👉 操作? (y=通过 / n=重译 / s=跳过): ").strip().lower()
+                if user_choice == 'y':
+                    st['status'] = 'success'
+                    print("   ✅ Marked as Success")
                     break
-            except Exception as e:
-                print(f" ⚠️ {e}")
-                time.sleep(2)
+                elif user_choice == 'n':
+                    st['status'] = 'pending'
+                    st['trans'] = ""
+                    print("   🔄 Marked as Pending")
+                    break
+                elif user_choice == 's':
+                    print("   ⏭️ Skipped")
+                    break
         
-        if not success:
-            task["status"] = "failed"
-            print(" ❌")
-        
-        if cache_path:
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(cache_structure, f, ensure_ascii=False, indent=2)
+        _save_cache(cache_path, MODEL_NAME, current_tasks, raw_refs_text, layout_map_global)
 
-    # 阶段三：最终合并 (可选，主要用于调试，HTML 生成依赖 JSON)
+    # 阶段二
+    pending_tasks = [t for t in current_tasks if t["status"] == "pending"]
+    if pending_tasks:
+        print(f"\n🚀 [阶段二] 开始推理 (剩余 {len(pending_tasks)} 个)...")
+        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        PROMPT_MAP = {
+            "meta": SYSTEM_PROMPT_META,
+            "body": SYSTEM_PROMPT_BODY.replace("{ref_map_str}", ref_map_str),
+            "asset": SYSTEM_PROMPT_ASSET.replace("{ref_map_str}", ref_map_str)
+        }
+        for task in current_tasks:
+            if task["status"] != "pending": continue
+            print(f"   ⚡ Part {task['id']+1}/{len(current_tasks)} [{task['type'].upper()}] ...", end="", flush=True)
+            
+            messages = [
+                {"role": "system", "content": PROMPT_MAP.get(task['type'], PROMPT_MAP["body"])},
+                {"role": "user", "content": task["src"]}
+            ]
+            
+            success = False
+            for attempt in range(3):
+                try:
+                    response = client.chat.completions.create(model=MODEL_NAME, messages=messages, temperature=0.1)
+                    res_text = response.choices[0].message.content
+                    res_text = re.sub(r'^```xml\s*', '', res_text)
+                    res_text = re.sub(r'```$', '', res_text)
+                    if res_text:
+                        task["trans"] = res_text.strip()
+                        task["status"] = "success"
+                        print(" ✅")
+                        success = True
+                        break
+                except Exception as e:
+                    print(f" ⚠️ {e}")
+                    time.sleep(2)
+            if not success:
+                task["status"] = "failed"
+                print(" ❌")
+            if cache_path: _save_cache(cache_path, MODEL_NAME, current_tasks, raw_refs_text, layout_map_global)
+    else:
+        print("\n🎉 无需新增推理。")
+
+    # 阶段三
+    print("💾 [阶段三] 刷新结果文件...")
     final_body = "\n".join([t["trans"] for t in current_tasks if t["status"] == "success"])
+    final_refs = ""
+    if raw_refs_text:
+        final_refs = f"\n<header_block><src>References</src><trans>参考文献</trans></header_block>\n"
+        clean_ref_content = re.sub(r'\[\[HEADER:.*?\]\]', '', raw_refs_text).strip()
+        final_refs += f"<ref_block><src>{clean_ref_content}</src></ref_block>"
+
     with open(output_path, 'w', encoding='utf-8') as f: 
-        f.write(final_body)
-        
+        f.write(final_body + "\n" + final_refs)
     return output_path
+
+def _save_cache(path, model, tasks, refs, layout):
+    if not path: return
+    structure = { "model": model, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "tasks": tasks, "raw_references": refs, "layout_map": layout }
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(structure, f, ensure_ascii=False, indent=2)
+
+# 辅助函数：保存 Cache，避免代码重复
+def _save_cache(path, model, tasks, refs, layout):
+    if not path: return
+    structure = {
+        "model": model,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "tasks": tasks,
+        "raw_references": refs,
+        "layout_map": layout
+    }
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(structure, f, ensure_ascii=False, indent=2)
 
 # --- 辅助函数：任务切分 (升级版：强制隔离标题) ---
 def split_text_into_chunks(text, max_chars):
@@ -1052,27 +1182,24 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
     if not os.path.exists(cache_path):
         return "Error: 找不到缓存文件，无法执行高级可视化。"
     
-    # 获取论文名称 (文件夹名)
+    # 获取论文名称 (即文件夹名)
     raw_name = os.path.basename(paper_vis_dir)
     html_path = os.path.join(paper_vis_dir, f"{raw_name}_Report.html")
     
-    # --- 核心新增：资源搬运逻辑 ---
-    # 目的：将提取阶段保存在 extracted_output/.../assets 的图片，搬运到 vis_output/.../assets
-    
-    # 1. 定义目标路径
+    # --- 【新增】资源搬运准备 ---
+    # 目标目录: ./vis_output/{PaperName}/assets
     vis_assets_dest = os.path.join(paper_vis_dir, "assets")
     if not os.path.exists(vis_assets_dest):
         os.makedirs(vis_assets_dest, exist_ok=True)
         
-    # 2. 推导源路径 (假设 extracted_output 与 vis_output 在同一级目录)
-    # 目录结构假设: 
-    #   root/vis_output/PaperName
-    #   root/extracted_output/assets (根据新的 extract 函数逻辑，所有图片混在 extracted_output/assets 下)
-    #   注意：如果在 extract 函数中修改了保存路径，这里需要对应修改。
+    # 源目录推导: 假设 extracted_output 与 vis_output 在同一级根目录下
+    # paper_vis_dir 通常是 .../vis_output/{PaperName}
+    # 我们需要找到 .../extracted_output/{PaperName}/assets
+    root_dir = os.path.dirname(os.path.dirname(paper_vis_dir)) 
+    extracted_assets_src = os.path.join(root_dir, "extracted_output", raw_name, "assets")
     
-    root_dir = os.path.dirname(os.path.dirname(paper_vis_dir)) # 回退两级找到 root
-    # 猜测源目录位置
-    extracted_assets_src = os.path.join(root_dir, "extracted_output", "assets") 
+    # 调试信息 (可选)
+    # print(f"DEBUG: Copying assets from {extracted_assets_src} to {vis_assets_dest}")
     
     # 读取 Cache JSON
     try:
@@ -1083,10 +1210,10 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
 
     tasks = cache_data.get("tasks", [])
     raw_refs = cache_data.get("raw_references", "")
-    layout_map = cache_data.get("layout_map", {}) # 读取物理位置信息 { str(task_id): [asset_ids] }
+    layout_map = cache_data.get("layout_map", {})
 
     # ==========================================================================
-    # 2. 构建资源字典 (Assets Map) & 执行搬运
+    # 2. 构建资源字典 & 执行搬运 (Copy)
     # ==========================================================================
     meta_task = None
     asset_task = None
@@ -1099,153 +1226,110 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
 
     assets_map = {}
     
+    # 定义搬运函数
+    def copy_and_get_rel_path(asset_id):
+        filename = f"{asset_id}.png"
+        src_file = os.path.join(extracted_assets_src, filename)
+        dst_file = os.path.join(vis_assets_dest, filename)
+        
+        # 执行拷贝
+        if os.path.exists(src_file):
+            shutil.copy2(src_file, dst_file)
+        
+        # 返回 HTML 用的相对路径
+        return f"./assets/{filename}"
+
     if asset_task:
         src_full = asset_task.get('src', '')
         trans_full = asset_task.get('trans', '')
         
-        # Helper: 搬运单张图片
-        def copy_asset_image(asset_id):
-            filename = f"{asset_id}.png"
-            src_img = os.path.join(extracted_assets_src, filename)
-            dst_img = os.path.join(vis_assets_dest, filename)
-            # 只有源文件存在才搬运
-            if os.path.exists(src_img):
-                shutil.copy2(src_img, dst_img)
-            return f"./assets/{filename}"
-
-        # A. 处理带标题的资源 (Caption)
+        # A. Captioned Assets (有标题的图表)
         src_iter = re.finditer(r'\[\[ASSET_CAPTION:\s*(.*?)\s*\|\s*(.*?)\]\]', src_full, re.DOTALL)
         for m in src_iter:
             aid = m.group(1).strip()
             src_txt = m.group(2).strip()
             
-            # 尝试提取 XML 翻译
             trans_match = re.search(fr'<asset id=["\']?{re.escape(aid)}["\']?>(.*?)</asset>', trans_full, re.DOTALL)
             trans_txt = trans_match.group(1).strip() if trans_match else "(未找到译文)"
             
-            # 搬运图片并获取相对路径
-            rel_path = copy_asset_image(aid)
+            # --- 核心：在这里搬运 ---
+            rel_path = copy_and_get_rel_path(aid)
             
             assets_map[aid] = {
-                "id": aid,
-                "type": "captioned",
-                "src": src_txt,
-                "trans": trans_txt,
-                "path": rel_path
+                "id": aid, "type": "captioned", "src": src_txt, "trans": trans_txt, "path": rel_path
             }
             
-        # B. 处理占位符资源 (Placeholder)
+        # B. Placeholder Assets (无标题的公式/插图)
         ph_iter = re.finditer(r'\[\[ASSET_PLACEHOLDER:\s*(.*?)\]\]', src_full)
         for m in ph_iter:
             aid = m.group(1).strip()
             if aid not in assets_map:
-                rel_path = copy_asset_image(aid)
+                # --- 核心：在这里搬运 ---
+                rel_path = copy_and_get_rel_path(aid)
                 assets_map[aid] = {
-                    "id": aid,
-                    "type": "placeholder",
-                    "src": "",
-                    "trans": "",
-                    "path": rel_path
+                    "id": aid, "type": "placeholder", "src": "", "trans": "", "path": rel_path
                 }
 
     # ==========================================================================
-    # 3. 渲染辅助函数
+    # 3. 渲染逻辑 (物理优先 + 逻辑引用兜底)
     # ==========================================================================
-    
     def clean_xml_and_headers(text):
-        """清洗 LLM 输出，并格式化链接"""
         if not text: return ""
         text = re.sub(r'^```xml', '', text).replace('```', '')
-        # 移除 Header 标记，保留内容
         text = re.sub(r'\[\[HEADER:\s*(.*?)\]\]', r'\1', text)
-        # 移除 XML 标签
         text = text.replace('<header>', '').replace('</header>', '') 
         text = text.replace('<p>', '').replace('</p>', '<br>')
-        # 格式化内部链接
         text = re.sub(r'\[\[LINK:\s*([^\|]+)\|(.*?)\]\]', r'<a href="#\1" class="internal-link">\2</a>', text)
-        # 格式化参考文献引用 [1]
         def ref_sub(m):
             full_str = m.group(1) 
             first_num = re.search(r'\d+', full_str)
-            if first_num:
-                return f'<a href="#ref-{first_num.group(0)}" class="citation-mark">{full_str}</a>'
+            if first_num: return f'<a href="#ref-{first_num.group(0)}" class="citation-mark">{full_str}</a>'
             return f'<span class="citation-mark">{full_str}</span>'
         text = re.sub(r'(\[\s*\d+(?:[\s,\-~]+\d+)*\s*\])', ref_sub, text)
         return text
 
-    # ==========================================================================
-    # 4. 组装 HTML
-    # ==========================================================================
-
-    # --- Part A: Meta ---
+    # --- HTML 组装 ---
     html_meta = ""
     if meta_task:
         m_src = meta_task.get('src', '')
         m_trans = meta_task.get('trans', '')
-        
         t_en = re.search(r'\[\[META_TITLE:(.*?)\]\]', m_src, re.DOTALL)
         t_en = t_en.group(1).strip() if t_en else ""
-        
-        a_en = re.search(r'\[\[META_AUTHOR:(.*?)\]\]', m_src, re.DOTALL)
-        a_en = a_en.group(1).strip() if a_en else ""
-        
         t_zh = re.search(r'<meta_title>(.*?)</meta_title>', m_trans, re.DOTALL)
         t_zh = t_zh.group(1).strip() if t_zh else ""
-        
+        a_en = re.search(r'\[\[META_AUTHOR:(.*?)\]\]', m_src, re.DOTALL)
+        a_en = a_en.group(1).strip() if a_en else ""
         a_zh = re.search(r'<meta_author>(.*?)</meta_author>', m_trans, re.DOTALL)
         a_zh = a_zh.group(1).strip() if a_zh else ""
-        
-        html_meta = f"""
-        <div class="meta-section">
-            <h1 class="meta-title-en">{t_en}</h1>
-            <h1 class="meta-title-zh">{t_zh}</h1>
-            <div class="meta-author-en">{a_en}</div>
-            <div class="meta-author-zh">{a_zh}</div>
-        </div>
-        <hr class="meta-divider">
-        """
+        html_meta = f"""<div class="meta-section"><h1 class="meta-title-en">{t_en}</h1><h1 class="meta-title-zh">{t_zh}</h1><div class="meta-author-en">{a_en}</div><div class="meta-author-zh">{a_zh}</div></div><hr class="meta-divider">"""
 
-    # --- Part B: Body (含 物理位置 + 逻辑引用 双重插入) ---
     html_body = ""
     placed_assets = set()
     
     for task in body_tasks:
-        # 获取当前 task 的全局 ID
         global_task_id = task['id']
-        
-        # 1. 【物理位置插入】检查当前 Chunk 是否关联了 Asset 物理位置
-        # layout_map 的 key 是字符串类型的 id
         layout_assets = layout_map.get(str(global_task_id), [])
         
+        # 1. 物理位置插入
         for aid in layout_assets:
             if aid in assets_map and aid not in placed_assets:
                 asset = assets_map[aid]
                 html_body += render_asset_html(aid, asset)
-                placed_assets.add(aid) # 标记已插入，防止重复
+                placed_assets.add(aid)
         
-        # 2. 渲染正文文本
+        # 2. 文本
         src_txt = task.get('src', '')
         trans_txt = task.get('trans', '')
-        
         is_header_src = "[[HEADER:" in src_txt
         is_header_trans = "[[HEADER:" in trans_txt or "<header>" in trans_txt
-        
         row_class = "header-row" if (is_header_src or is_header_trans) else "text-row"
-        
         display_src = re.sub(r'\[\[HEADER:\s*(.*?)\]\]', r'\1', src_txt)
         display_src = re.sub(r'(\[\s*\d+(?:[\s,\-~]+\d+)*\s*\])', r'<span class="citation-mark-src">\1</span>', display_src)
-        
         display_trans = clean_xml_and_headers(trans_txt)
         
-        html_body += f"""
-        <div class="row {row_class}">
-            <div class="col-src">{display_src}</div>
-            <div class="col-trans">{display_trans}</div>
-        </div>
-        """
+        html_body += f"""<div class="row {row_class}"><div class="col-src">{display_src}</div><div class="col-trans">{display_trans}</div></div>"""
         
-        # 3. 【逻辑引用插入】(兜底补漏)
-        # 如果文中引用了 [[LINK: ID|...]]，但因为物理位置偏差没插进去，在这里补插
+        # 3. 逻辑引用补漏
         mentions = re.findall(r'\[\[LINK:\s*([^\|]+)\|', src_txt)
         for mid in mentions:
             if mid in assets_map and mid not in placed_assets:
@@ -1253,7 +1337,7 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
                 html_body += render_asset_html(mid, asset)
                 placed_assets.add(mid)
 
-    # --- Part C: 附录资源 (未被使用的) ---
+    # 4. 剩余资源
     remaining = [k for k in assets_map.keys() if k not in placed_assets]
     if remaining:
         html_body += '<div class="row"><div style="width:100%; text-align:center; color:#999; padding:20px;">--- 附录资源 (未在正文位置或引用中检测到) ---</div></div>'
@@ -1261,25 +1345,18 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
             asset = assets_map[mid]
             html_body += render_asset_html(mid, asset)
 
-    # --- Part D: Refs ---
     html_refs = ""
     if raw_refs:
         refs_content = re.sub(r'\[\[HEADER:.*?\]\]', '', raw_refs).strip()
         ref_entries = re.split(r'\[(\d+)\]', refs_content)
-        
         ref_items = ""
         for i in range(1, len(ref_entries), 2):
             rid = ref_entries[i]
             rtext = ref_entries[i+1].strip()
-            ref_items += f"""
-            <div class="ref-item" id="ref-{rid}">
-                <div class="ref-id">[{rid}]</div>
-                <div class="ref-text">{rtext}</div>
-            </div>
-            """
+            ref_items += f"""<div class="ref-item" id="ref-{rid}"><div class="ref-id">[{rid}]</div><div class="ref-text">{rtext}</div></div>"""
         html_refs = f"""<div class="ref-section"><h2 class="ref-title">References</h2><div class="ref-list">{ref_items}</div></div>"""
 
-    # --- Final HTML Template ---
+    # --- HTML Template ---
     full_html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1289,55 +1366,38 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
         :root {{ --primary: #2c3e50; --accent: #3498db; --bg: #f8f9fa; --border: #e0e0e0; --header-bg: #eef6fc; --header-text: #2980b9; }}
         body {{ font-family: "Segoe UI", Roboto, "Microsoft YaHei", sans-serif; margin: 0; background: var(--bg); color: #333; line-height: 1.6; }}
         .container {{ max-width: 1200px; margin: 0 auto; background: #fff; box-shadow: 0 0 20px rgba(0,0,0,0.05); }}
-        
-        /* Meta */
         .meta-section {{ padding: 40px; text-align: center; background: #fff; }}
         .meta-title-en {{ font-size: 1.8em; color: #2c3e50; margin-bottom: 10px; font-weight: 700; }}
         .meta-title-zh {{ font-size: 1.6em; color: #34495e; margin-top: 0; margin-bottom: 20px; font-weight: 400; }}
         .meta-author-en {{ font-size: 1em; color: #7f8c8d; font-style: italic; }}
         .meta-author-zh {{ font-size: 1em; color: #16a085; font-weight: bold; margin-top: 5px; }}
         .meta-divider {{ border: 0; border-top: 1px solid #eee; margin: 0; }}
-
-        /* Grid */
         .row {{ display: flex; border-bottom: 1px solid var(--border); }}
         .col-src {{ flex: 1; padding: 20px; border-right: 1px solid var(--border); color: #555; font-family: "Cambria", serif; font-size: 15px; background: #fff; }}
         .col-trans {{ flex: 1; padding: 20px; color: #111; font-size: 16px; background: #fdfdfd; }}
-        
-        /* Header */
         .header-row {{ background-color: var(--header-bg) !important; border-bottom: 2px solid #d6eaf8; }}
         .header-row .col-src, .header-row .col-trans {{ font-weight: bold; color: var(--header-text); font-size: 1.2em; background: transparent; }}
-
-        /* Assets */
         .asset-row {{ display: block; background: #f4f4f4; padding: 20px; border-bottom: 1px solid #ddd; }}
         .asset-card {{ background: #fff; max-width: 90%; margin: 0 auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); overflow: hidden; }}
-        .placeholder-card {{ max-width: 60%; }} /* 公式卡片窄一点 */
-        
+        .placeholder-card {{ max-width: 60%; }} 
         .asset-header {{ background: #f8f9fa; padding: 10px 20px; font-weight: bold; color: #555; border-bottom: 1px solid #eee; }}
         .asset-header-mini {{ background: #f8f9fa; padding: 5px 15px; font-size: 0.9em; color: #888; border-bottom: 1px solid #eee; }}
-        
         .asset-tag {{ background: #3498db; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; margin-right: 5px; }}
         .asset-img {{ display: block; max-width: 100%; max-height: 600px; margin: 0 auto; }}
         .asset-img-raw {{ display: block; max-width: 100%; margin: 10px auto; }}
-        
         .asset-desc-box {{ padding: 20px; background: #fffdf5; border-top: 1px solid #eee; }}
         .asset-desc-en {{ font-style: italic; color: #666; margin-bottom: 10px; font-size: 0.95em; border-bottom: 1px dashed #ddd; padding-bottom: 8px; }}
         .asset-desc-zh {{ font-weight: 500; color: #2c3e50; }}
-
-        /* Refs */
         .ref-section {{ padding: 40px; background: #fff; border-top: 4px solid #2c3e50; }}
         .ref-title {{ text-align: center; color: #2c3e50; margin-bottom: 30px; }}
         .ref-list {{ display: grid; grid-template-columns: 1fr; gap: 15px; }}
         .ref-item {{ display: flex; align-items: flex-start; }}
         .ref-id {{ min-width: 40px; font-weight: bold; color: #e74c3c; text-align: right; margin-right: 15px; }}
         .ref-text {{ font-size: 0.95em; color: #555; word-break: break-word; }}
-
-        /* Inline */
         .citation-mark {{ color: #e74c3c; font-weight: bold; cursor: pointer; background: rgba(231, 76, 60, 0.1); padding: 0 2px; border-radius: 2px; font-size: 0.9em; }}
         .citation-mark-src {{ color: #999; font-size: 0.9em; }}
         .internal-link {{ color: #3498db; text-decoration: none; font-weight: 500; background: rgba(52,152,219,0.1); padding: 0 4px; border-radius: 3px; }}
         .internal-link:hover {{ background: rgba(52,152,219,0.2); text-decoration: underline; }}
-        
-        /* Anchor Highlight */
         :target {{ scroll-margin-top: 20px; animation: highlight 2s ease; }}
         @keyframes highlight {{ 0% {{ background-color: #fff3cd; }} 100% {{ background-color: transparent; }} }}
     </style>
@@ -1357,27 +1417,9 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
     except Exception as e:
         return f"HTML 写入失败: {e}"
 
-# 单独的渲染函数（必须放在主函数外，或者上面主函数内已包含）
+# 单独的渲染函数
 def render_asset_html(mid, asset):
     if asset["type"] == "placeholder":
-        return f"""
-        <div class="row asset-row" id="{mid}">
-            <div class="asset-card placeholder-card">
-                <div class="asset-header-mini">{mid}</div>
-                <img src="{asset['path']}" class="asset-img-raw" loading="lazy">
-            </div>
-        </div>
-        """
+        return f"""<div class="row asset-row" id="{mid}"><div class="asset-card placeholder-card"><div class="asset-header-mini">{mid}</div><img src="{asset['path']}" class="asset-img-raw" loading="lazy"></div></div>"""
     else:
-        return f"""
-        <div class="row asset-row" id="{mid}">
-            <div class="asset-card">
-                <div class="asset-header"><span class="asset-tag">Resource</span> {mid}</div>
-                <img src="{asset['path']}" class="asset-img" loading="lazy">
-                <div class="asset-desc-box">
-                    <div class="asset-desc-en">{asset['src']}</div>
-                    <div class="asset-desc-zh">{asset['trans']}</div>
-                </div>
-            </div>
-        </div>
-        """
+        return f"""<div class="row asset-row" id="{mid}"><div class="asset-card"><div class="asset-header"><span class="asset-tag">Resource</span> {mid}</div><img src="{asset['path']}" class="asset-img" loading="lazy"><div class="asset-desc-box"><div class="asset-desc-en">{asset['src']}</div><div class="asset-desc-zh">{asset['trans']}</div></div></div></div>"""
