@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 学术文献翻译工作台</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/fabric@5.3.0/dist/fabric.min.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div v-if="isBusy" class="loading-overlay">
+        <div class="spinner"></div>
+        <div class="loading-text">{{ busyMsg }}</div>
+      </div>
+
+      <div v-if="!currentPaper" class="dashboard-container">
+        <div class="dashboard-header">
+          <div class="dashboard-title">📄 本地文献翻译工作台</div>
+          <div style="color: #777; margin-top: 5px">
+            Local Paper Translation Workbench
+          </div>
+        </div>
+
+        <div class="paper-list-container">
+          <div class="list-header">
+            <div class="col-status">当前状态</div>
+            <div class="col-name">文件名</div>
+            <div class="col-action">操作</div>
+          </div>
+
+          <div v-for="p in papers" class="paper-row" @click="selectPaper(p)">
+            <div class="col-status">
+              <span
+                :class="['status-badge', {
+                            done: p.status==='已完成', 
+                            trans: p.status==='已翻译',
+                            extract: p.status==='已提取'
+                        }]"
+              >
+                {{ p.status }}
+              </span>
+            </div>
+
+            <div class="paper-name-cell" :title="p.filename">
+              {{ p.filename }}
+            </div>
+
+            <div class="col-action">
+              <span class="row-arrow">&rarr;</span>
+            </div>
+          </div>
+
+          <div
+            v-if="papers.length === 0"
+            style="padding: 40px; text-align: center; color: #999"
+          >
+            目录为空，请放入 PDF 文件。
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="workspace-layout">
+        <div class="navbar">
+          <div class="nav-left">
+            <button class="back-btn" @click="goBack">
+              <span>&larr;</span> 文献库
+            </button>
+            <div class="current-doc-title">{{ currentPaper.filename }}</div>
+          </div>
+          <div class="stepper">
+            <div :class="['step', {active: step===1}]" @click="step=1">
+              1. 布局标注
+            </div>
+            <div :class="['step', {active: step===2}]" @click="step=2">
+              2. 任务列表
+            </div>
+            <div :class="['step', {active: step===3}]" @click="step=3">
+              3. 结果预览
+            </div>
+          </div>
+          <div class="action-area">
+            <button
+              v-if="step===1"
+              class="btn btn-text"
+              @click="saveLayout(true)"
+            >
+              💾 保存 (Ctrl+S)
+            </button>
+            <button
+              v-if="step===1"
+              class="btn btn-warning"
+              @click="triggerExtract"
+            >
+              ⚡ 开始提取
+            </button>
+
+            <button
+              v-if="step===2"
+              class="btn btn-primary"
+              @click="triggerTranslate"
+            >
+              🚀 开始翻译
+            </button>
+
+            <button
+              v-if="step===3"
+              class="btn btn-text"
+              @click="generateReport"
+            >
+              🔄 刷新报告
+            </button>
+          </div>
+        </div>
+
+        <div class="main-content">
+          <div v-show="step===1" class="editor-wrapper">
+            <div class="toolbox">
+              <div class="toolbox-header">
+                <div class="section-title">标注工具</div>
+              </div>
+
+              <div class="tool-grid">
+                <div
+                  v-for="(t, idx) in tools"
+                  :class="['tool-btn', {active: currentTool === t.type}]"
+                  @click="setTool(t.type)"
+                  :title="t.label"
+                >
+                  <span class="color-dot" :style="{background: t.color}"></span>
+                  {{ t.type }} [{{idx+1}}]
+                </div>
+              </div>
+
+              <div
+                style="
+                  padding: 10px 15px;
+                  background: #fff;
+                  border-bottom: 1px solid #e0e0e0;
+                  font-size: 0.85em;
+                "
+              >
+                <div
+                  style="
+                    display: flex;
+                    justify-content: space-between;
+                    margin-bottom: 5px;
+                  "
+                >
+                  <span style="font-weight: bold; color: var(--primary)"
+                    >当前: #{{ pendingId }}</span
+                  >
+                  <span
+                    :style="{color: pendingRole==='Body'?'#2c3e50':'#e67e22', fontWeight:'bold'}"
+                    >{{ pendingRole }}</span
+                  >
+                </div>
+                <div style="display: flex; gap: 5px">
+                  <button
+                    :class="['btn-xs', {active: pendingRole==='Body'}]"
+                    style="flex: 1"
+                    @click="setPendingRole('Body')"
+                  >
+                    画内容
+                  </button>
+                  <button
+                    :class="['btn-xs', {active: pendingRole==='Caption'}]"
+                    style="flex: 1"
+                    @click="setPendingRole('Caption')"
+                  >
+                    画标题
+                  </button>
+                </div>
+              </div>
+
+              <div class="prop-panel" v-if="selectedItem">
+                <div
+                  class="section-title"
+                  style="margin-top: 0; color: var(--primary)"
+                >
+                  修改选中项
+                </div>
+                <div class="prop-row">
+                  <span class="prop-label">ID:</span>
+                  <input
+                    class="id-input"
+                    :value="selectedItem.id"
+                    @input="updateSelectedId"
+                  />
+                </div>
+                <div
+                  class="prop-row"
+                  v-if="['Figure','Table','Algorithm'].includes(selectedItem.type)"
+                >
+                  <div class="role-group">
+                    <label class="role-radio"
+                      ><input
+                        type="radio"
+                        value="Body"
+                        :checked="selectedItem.role === 'Body'"
+                        @change="updateSelectedRole('Body')"
+                      />内容</label
+                    >
+                    <label class="role-radio"
+                      ><input
+                        type="radio"
+                        value="Caption"
+                        :checked="selectedItem.role === 'Caption'"
+                        @change="updateSelectedRole('Caption')"
+                      />标题</label
+                    >
+                  </div>
+                </div>
+              </div>
+              <div
+                class="prop-panel"
+                v-else
+                style="
+                  text-align: center;
+                  color: #ccc;
+                  font-size: 0.85em;
+                  padding: 15px;
+                "
+              >
+                (点击画框修改属性)
+              </div>
+
+              <div
+                class="toolbox-header"
+                style="margin-top: auto; border-top: 1px solid #e0e0e0"
+              >
+                <div class="section-title">已标列表 (本页)</div>
+              </div>
+
+              <div class="list-panel">
+                <div
+                  v-for="group in groupedItems"
+                  :key="group.type + '-' + group.id"
+                  style="border-bottom: 1px solid #eee"
+                >
+                  <div
+                    style="
+                      padding: 5px 15px;
+                      background: #f9f9f9;
+                      font-weight: bold;
+                      font-size: 0.85em;
+                      color: #555;
+                      display: flex;
+                      justify-content: space-between;
+                    "
+                  >
+                    <span>{{ group.displayLabel }}</span>
+                  </div>
+                  <div
+                    v-for="item in group.children"
+                    :class="['list-item', {selected: selectedItem && selectedItem.uuid === item.uuid}]"
+                    @click="selectFromList(item)"
+                  >
+                    <span class="list-sub-item">
+                      {{ item.role === 'Body' ? '内容区域' : '标题文字' }}
+                    </span>
+                  </div>
+                </div>
+                <div
+                  v-if="groupedItems.length === 0"
+                  style="
+                    padding: 20px;
+                    text-align: center;
+                    color: #ccc;
+                    font-size: 0.8em;
+                  "
+                >
+                  暂无数据
+                </div>
+              </div>
+
+              <div class="page-nav">
+                <button
+                  class="page-btn"
+                  @click="prevPage"
+                  :disabled="pageIdx<=0"
+                >
+                  &lt;
+                </button>
+                <span>{{ pageIdx + 1 }} / {{ totalPages }}</span>
+                <button
+                  class="page-btn"
+                  @click="nextPage"
+                  :disabled="pageIdx>=totalPages-1"
+                >
+                  &gt;
+                </button>
+              </div>
+            </div>
+
+            <div class="canvas-container">
+              <div class="canvas-shadow-box"><canvas id="c"></canvas></div>
+            </div>
+          </div>
+
+          <div v-if="step===2" class="task-dashboard" style="width: 100%">
+            <div class="task-header">
+              <div class="task-stats">
+                <span>总段落: <b>{{ taskStats.total }}</b></span>
+                <span>总字符: <b>{{ taskStats.chars }}</b></span>
+              </div>
+              <button class="btn btn-primary" @click="triggerTranslate">
+                开始翻译所有任务 &rarr;
+              </button>
+            </div>
+            <div class="task-list-container">
+              <div
+                v-for="(task, idx) in translationTasks"
+                :key="idx"
+                class="task-card"
+              >
+                <div class="task-meta-row">
+                  <div>
+                    <span :class="['type-tag', `type-${task.type}`]"
+                      >{{ task.type }}</span
+                    >
+                    <span style="margin-left: 10px">ID: {{ task.id }}</span>
+                  </div>
+                  <div>待翻译</div>
+                </div>
+                <div class="task-content-row">
+                  <div
+                    class="source-col"
+                    @mousemove="showPromptPreview($event, task)"
+                    @mouseleave="hidePromptPreview"
+                    @click.stop="toggleTooltipLock"
+                    style="cursor: help"
+                  >
+                    {{ task.src }}
+                  </div>
+
+                  <div class="target-col">
+                    <div class="trans-placeholder" v-if="!task.trans">
+                      翻译后将显示在此处...
+                    </div>
+                    <div v-else>{{ task.trans }}</div>
+                  </div>
+                </div>
+
+                <div
+                  id="prompt-tooltip"
+                  class="prompt-tooltip"
+                  style="display: none"
+                >
+                  <div class="pt-header">LLM 输入预览 (System + User)</div>
+                  <div class="pt-content"></div>
+                </div>
+              </div>
+              <div
+                v-if="translationTasks.length === 0"
+                style="text-align: center; padding: 50px; color: #999"
+              >
+                没有找到提取内容，请检查 Step 1 标注是否正确。
+              </div>
+            </div>
+          </div>
+
+          <div
+            v-if="step===3"
+            style="width: 100%; height: 100%; background: #fff"
+          >
+            <iframe
+              v-if="reportUrl"
+              :src="reportUrl"
+              class="preview-frame"
+            ></iframe>
+            <div
+              v-else
+              style="
+                height: 100%;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                color: #777;
+              "
+            >
+              <div style="text-align: center">
+                <p>等待加载报告...</p>
+                <button class="btn btn-primary" @click="generateReport">
+                  🔄 手动刷新
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/static/js/app.js"></script>
+  </body>
+</html>
