@@ -33,11 +33,12 @@
           <div v-for="p in papers" class="paper-row" @click="selectPaper(p)">
             <div class="col-status">
               <span
-                :class="['status-badge', {
-                            done: p.status==='已完成', 
-                            trans: p.status==='已翻译',
-                            extract: p.status==='已提取'
-                        }]"
+                class="status-badge"
+                :class="{
+                  'done': p.status === '已完成' || p.status === '翻译完成',
+                  'trans': p.status.includes('翻译中') || p.status === '已翻译',
+                  'extract': p.status === '已提取'
+                }"
               >
                 {{ p.status }}
               </span>
@@ -69,17 +70,19 @@
             </button>
             <div class="current-doc-title">{{ currentPaper.filename }}</div>
           </div>
+
           <div class="stepper">
-            <div :class="['step', {active: step===1}]" @click="step=1">
+            <div class="step" :class="{active: step===1}" @click="step=1">
               1. 布局标注
             </div>
-            <div :class="['step', {active: step===2}]" @click="step=2">
+            <div class="step" :class="{active: step===2}" @click="step=2">
               2. 任务列表
             </div>
-            <div :class="['step', {active: step===3}]" @click="step=3">
+            <div class="step" :class="{active: step===3}" @click="step=3">
               3. 结果预览
             </div>
           </div>
+
           <div class="action-area">
             <button
               v-if="step===1"
@@ -98,10 +101,12 @@
 
             <button
               v-if="step===2"
-              class="btn btn-primary"
+              class="btn"
+              :class="isTranslating ? 'btn-danger' : 'btn-primary'"
               @click="triggerTranslate"
             >
-              🚀 开始翻译
+              <span v-if="isTranslating">🛑 停止监控 (后台继续)</span>
+              <span v-if="!isTranslating">{{ translationBtnLabel }}</span>
             </button>
 
             <button
@@ -124,7 +129,8 @@
               <div class="tool-grid">
                 <div
                   v-for="(t, idx) in tools"
-                  :class="['tool-btn', {active: currentTool === t.type}]"
+                  class="tool-btn"
+                  :class="{active: currentTool === t.type}"
                   @click="setTool(t.type)"
                   :title="t.label"
                 >
@@ -158,14 +164,16 @@
                 </div>
                 <div style="display: flex; gap: 5px">
                   <button
-                    :class="['btn-xs', {active: pendingRole==='Body'}]"
+                    class="btn-xs"
+                    :class="{active: pendingRole==='Body'}"
                     style="flex: 1"
                     @click="setPendingRole('Body')"
                   >
                     画内容
                   </button>
                   <button
-                    :class="['btn-xs', {active: pendingRole==='Caption'}]"
+                    class="btn-xs"
+                    :class="{active: pendingRole==='Caption'}"
                     style="flex: 1"
                     @click="setPendingRole('Caption')"
                   >
@@ -215,7 +223,7 @@
               </div>
               <div
                 class="prop-panel"
-                v-else
+                v-if="!selectedItem"
                 style="
                   text-align: center;
                   color: #ccc;
@@ -254,12 +262,14 @@
                   </div>
                   <div
                     v-for="item in group.children"
-                    :class="['list-item', {selected: selectedItem && selectedItem.uuid === item.uuid}]"
+                    class="list-item"
+                    :class="{selected: selectedItem && selectedItem.uuid === item.uuid}"
                     @click="selectFromList(item)"
                   >
-                    <span class="list-sub-item">
-                      {{ item.role === 'Body' ? '内容区域' : '标题文字' }}
-                    </span>
+                    <span class="list-sub-item"
+                      >{{ item.role === 'Body' ? '内容区域' : '标题文字'
+                      }}</span
+                    >
                   </div>
                 </div>
                 <div
@@ -302,13 +312,21 @@
           <div v-if="step===2" class="task-dashboard" style="width: 100%">
             <div class="task-header">
               <div class="task-stats">
-                <span>总段落: <b>{{ taskStats.total }}</b></span>
-                <span>总字符: <b>{{ taskStats.chars }}</b></span>
+                <span style="margin-right: 15px; font-size: 1.1em">
+                  进度:
+                  <b
+                    :style="{color: completedTaskCount === translationTasks.length ? '#27ae60' : '#e67e22'}"
+                  >
+                    {{ completedTaskCount }}
+                  </b>
+                  / {{ translationTasks.length }}
+                </span>
+                <span style="color: #999; font-size: 0.9em"
+                  >(总字符: {{ taskStats.chars }})</span
+                >
               </div>
-              <button class="btn btn-primary" @click="triggerTranslate">
-                开始翻译所有任务 &rarr;
-              </button>
             </div>
+
             <div class="task-list-container">
               <div
                 v-for="(task, idx) in translationTasks"
@@ -317,13 +335,30 @@
               >
                 <div class="task-meta-row">
                   <div>
-                    <span :class="['type-tag', `type-${task.type}`]"
+                    <span class="type-tag" :class="`type-${task.type}`"
                       >{{ task.type }}</span
                     >
                     <span style="margin-left: 10px">ID: {{ task.id }}</span>
                   </div>
-                  <div>待翻译</div>
+                  <div style="font-size: 0.9em">
+                    <span
+                      v-if="task.status === 'success'"
+                      style="color: #27ae60; font-weight: bold"
+                      >✅ 已完成</span
+                    >
+                    <span
+                      v-if="task.status === 'failed'"
+                      style="color: #e74c3c; font-weight: bold"
+                      >❌ 失败</span
+                    >
+                    <span
+                      v-if="task.status !== 'success' && task.status !== 'failed'"
+                      style="color: #999"
+                      >⏳ 待处理</span
+                    >
+                  </div>
                 </div>
+
                 <div class="task-content-row">
                   <div
                     class="source-col"
@@ -337,9 +372,14 @@
 
                   <div class="target-col">
                     <div class="trans-placeholder" v-if="!task.trans">
-                      翻译后将显示在此处...
+                      <span v-if="task.status === 'pending'"
+                        >正在思考中...</span
+                      >
+                      <span v-if="task.status !== 'pending'"
+                        >翻译后将显示在此处...</span
+                      >
                     </div>
-                    <div v-else>{{ task.trans }}</div>
+                    <div v-if="task.trans">{{ task.trans }}</div>
                   </div>
                 </div>
 
@@ -352,6 +392,7 @@
                   <div class="pt-content"></div>
                 </div>
               </div>
+
               <div
                 v-if="translationTasks.length === 0"
                 style="text-align: center; padding: 50px; color: #999"
@@ -371,7 +412,7 @@
               class="preview-frame"
             ></iframe>
             <div
-              v-else
+              v-if="!reportUrl"
               style="
                 height: 100%;
                 display: flex;

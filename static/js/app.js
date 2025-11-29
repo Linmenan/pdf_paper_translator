@@ -45,6 +45,8 @@ createApp({
       promptTemplates: {},
       currentRefMap: "", // [新增] 用于存储当前论文的引用映射表
       isTooltipLocked: false, // [新增] 锁定状态
+      eventSource: null, // [新增] SSE 连接对象
+      isTranslating: false,
     };
   },
   computed: {
@@ -127,11 +129,31 @@ createApp({
           return a.id - b.id;
         });
     },
+    // [新增 1] 统计已完成任务数
+    completedTaskCount() {
+      // 安全检查：如果不是数组，返回 0
+      if (!Array.isArray(this.translationTasks)) return 0;
+      return this.translationTasks.filter((t) => t.status === "success").length;
+    },
+
+    // [新增 2] 计算按钮显示的文字
+    translationBtnLabel() {
+      // 安全检查：如果不是数组，返回默认值
+      if (!Array.isArray(this.translationTasks)) return "🚀 开始翻译";
+      const hasProgress = this.translationTasks.some(
+        (t) => t.status === "success"
+      );
+      return hasProgress ? "▶️ 继续翻译" : "🚀 开始翻译";
+    },
     // === Step 2 任务统计 ===
     taskStats() {
+      // 安全检查
+      const tasks = Array.isArray(this.translationTasks)
+        ? this.translationTasks
+        : [];
       return {
-        total: this.translationTasks.length,
-        chars: this.translationTasks.reduce(
+        total: tasks.length,
+        chars: tasks.reduce(
           (acc, cur) => acc + (cur.text ? cur.text.length : 0),
           0
         ),
@@ -169,45 +191,73 @@ createApp({
     },
     async selectPaper(p) {
       if (this.hasUnsavedChanges && !confirm("Discard changes?")) return;
+
+      // 1. 清理旧状态 (必须保留)
+      this.closeSSE();
+      this.isTranslating = false;
+
       this.currentPaper = p;
       this.pageIdx = 0;
       this.layoutData = {};
       this.reportUrl = "";
-      this.step = 1;
+      this.step = 1; // 默认 Step 1
       this.hasUnsavedChanges = false;
       this.historyStack = [];
       this.selectedItem = null;
-      this.translationTasks = [];
+      this.translationTasks = []; // 先置空
 
-      // 获取布局数据
-      this.layoutData = await ApiService.getLayout(p.filename);
+      // 2. 加载布局数据 (Step 1 数据)
+      try {
+        this.layoutData = await ApiService.getLayout(p.filename);
+      } catch (e) {
+        console.warn("Layout load failed", e);
+      }
 
-      // 根据状态跳转步骤
-      if (p.status === "已完成" || p.status === "已翻译") {
-        this.step = 3;
-        if (p.status === "已完成") this.generateReport();
-      } else if (p.status === "已提取") {
+      // 3. [核心修复] 预加载任务数据 (Step 2 数据)
+      // 只要文件处理过（状态不是未开始），就尝试加载任务列表
+      // 这样无论进入 Step 2 还是 Step 3，切换 Tab 时数据都在
+      if (p.status !== "未开始") {
         try {
           const res = await ApiService.getExtractData(p.filename);
-
-          // [修改] 兼容处理：判断返回的是数组还是新版的对象
           if (Array.isArray(res)) {
             this.translationTasks = res;
-            this.currentRefMap = "(旧版本数据，未包含 Map)";
+            this.currentRefMap = "";
           } else {
-            this.translationTasks = res.tasks;
-            this.currentRefMap = res.ref_map || "(无引用资源)";
+            this.translationTasks = res.tasks || [];
+            this.currentRefMap = res.ref_map || "";
           }
-
-          this.step = 2;
         } catch (e) {
-          console.warn("无法加载提取数据，回退到 Step 1", e);
+          console.warn("尝试预加载任务数据失败 (可能文件被删):", e);
+        }
+      }
+
+      // 4. 根据状态决定初始显示的页面 (Step Router)
+      const s = p.status;
+
+      if (s === "已完成" || s === "翻译完成") {
+        // 如果已完成，优先看报告 (Step 3)
+        // 但因为上面已经加载了 Tasks，所以你手动切回 Step 2 也能看到数据了
+        this.step = 3;
+        if (s === "已完成") this.generateReport();
+      } else if (s.includes("已提取") || s.includes("翻译中")) {
+        // 如果是中间状态，进入任务列表 (Step 2)
+        if (this.translationTasks.length > 0) {
+          this.step = 2;
+        } else {
+          // 如果状态显示已提取，但读不到数据，回退到 Step 1
           this.step = 1;
         }
+      } else {
+        // 未开始 -> Step 1
+        this.step = 1;
       }
 
       await nextTick();
       if (this.step === 1) this.initEditor();
+    },
+    // [新增] 销毁时清理
+    beforeUnmount() {
+      this.closeSSE();
     },
     goBack() {
       if (this.hasUnsavedChanges && !confirm("Discard changes?")) return;
@@ -553,9 +603,19 @@ createApp({
         await this.saveLayout();
         await ApiService.triggerExtract(this.currentPaper.filename);
         this.busyMsg = "📥 正在加载任务列表...";
-        this.translationTasks = await ApiService.getExtractData(
-          this.currentPaper.filename
-        );
+
+        // 核心修复：处理后端返回的新格式（可能是数组，也可能是对象）
+        const res = await ApiService.getExtractData(this.currentPaper.filename);
+
+        if (Array.isArray(res)) {
+          // 旧格式兼容
+          this.translationTasks = res;
+        } else {
+          // 新格式：提取 tasks 字段
+          this.translationTasks = res.tasks || [];
+          this.currentRefMap = res.ref_map || "";
+        }
+
         this.step = 2;
       } catch (e) {
         console.error(e);
@@ -634,19 +694,78 @@ createApp({
     },
     // === 翻译流程 ===
     async triggerTranslate() {
-      this.isBusy = true;
-      this.busyMsg = "🤖 正在进行 AI 翻译，请耐心等待...";
+      // 简单的开关逻辑
+      if (this.isTranslating) {
+        this.closeSSE(); // 停止监听（后端仍在跑，但前端不再更新）
+        this.isTranslating = false;
+        alert("已暂停前端监控（后台任务仍在运行）");
+        return;
+      }
+
+      // 检查是否已完成
+      if (
+        this.translationTasks.length > 0 &&
+        this.translationTasks.every((t) => t.status === "success")
+      ) {
+        this.step = 3;
+        this.generateReport();
+        return;
+      }
+
+      this.isTranslating = true;
+      this.busyMsg = "🚀 翻译任务已启动...";
 
       try {
+        // 1. 告诉后端开始跑 (如果已经在跑，后端通常会继续)
         await ApiService.triggerTranslate(this.currentPaper.filename);
-        this.busyMsg = "📄 正在组装最终 HTML 报告...";
-        await this.generateReport();
-        this.step = 3;
+
+        // 2. 建立 SSE 连接监听进度
+        this.startSSE();
       } catch (e) {
         console.error(e);
-        alert("翻译失败: " + e.message);
-      } finally {
-        this.isBusy = false;
+        alert("启动失败: " + e.message);
+        this.isTranslating = false;
+      }
+    },
+    // [新增] 开启 SSE 连接
+    startSSE() {
+      this.closeSSE(); // 防止重复
+      const url = `${API_BASE}/api/stream/translation/${this.currentPaper.filename}`;
+
+      this.eventSource = new EventSource(url);
+
+      // 监听数据推送
+      this.eventSource.onmessage = (event) => {
+        const tasks = JSON.parse(event.data);
+        this.translationTasks = tasks; // 实时更新界面
+      };
+
+      // 监听结束信号 (我们在 server.py 里定义的 event: close)
+      this.eventSource.addEventListener("close", (e) => {
+        this.closeSSE();
+        this.isTranslating = false;
+
+        // 延迟跳转，提升体验
+        setTimeout(async () => {
+          if (confirm("翻译已完成！是否查看报告？")) {
+            await this.generateReport();
+            this.step = 3;
+          }
+        }, 500);
+      });
+
+      this.eventSource.onerror = (err) => {
+        console.warn("SSE 连接断开或出错", err);
+        // SSE 默认会自动重连，如果不需要自动重连可以手动 close
+        // this.closeSSE();
+      };
+    },
+
+    // [新增] 关闭连接
+    closeSSE() {
+      if (this.eventSource) {
+        this.eventSource.close();
+        this.eventSource = null;
       }
     },
 

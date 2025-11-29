@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from typing import List, Dict, Any
 from fastapi.responses import FileResponse
 import prompts
-
+import asyncio
+from fastapi.responses import StreamingResponse
 # 引入核心库
 import workflow_utils as wf
 
@@ -62,7 +63,7 @@ def get_prompts_config():
 # --- API: 首页获取项目列表 ---
 @app.get("/api/papers")
 def list_papers():
-    """扫描目录，返回所有PDF及其状态"""
+    """扫描目录，返回所有PDF及其精确状态"""
     papers = []
     if not os.path.exists(CONFIG["pdf_dir"]):
         return []
@@ -70,13 +71,37 @@ def list_papers():
     for f in os.listdir(CONFIG["pdf_dir"]):
         if f.lower().endswith(".pdf"):
             raw_name = wf.sanitize_filename(f)
-            # 简单状态判断
             status = "未开始"
-            if os.path.exists(os.path.join(CONFIG["vis_dir"], raw_name, f"{raw_name}_Report.html")):
+            
+            # 路径定义
+            report_path = os.path.join(CONFIG["vis_dir"], raw_name, f"{raw_name}_Report.html")
+            result_path = os.path.join(CONFIG["llm_dir"], f"{raw_name}_llm_result.txt")
+            cache_path = os.path.join(CONFIG["llm_dir"], f"{raw_name}_llm_cache.json")
+            context_path = os.path.join(CONFIG["extract_dir"], f"{raw_name}_context.txt")
+            
+            # 1. 优先级最高：已生成 HTML 报告
+            if os.path.exists(report_path):
                 status = "已完成"
-            elif os.path.exists(os.path.join(CONFIG["llm_dir"], f"{raw_name}_llm_result.txt")):
-                status = "已翻译"
-            elif os.path.exists(os.path.join(CONFIG["extract_dir"], f"{raw_name}_context.txt")):
+            # 2. 其次：LLM 结果文本已生成 (翻译流走完)
+            elif os.path.exists(result_path):
+                status = "翻译完成"
+            # 3. 再次：有缓存文件 (说明正在翻译或上次中断)
+            elif os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'r', encoding='utf-8') as cf:
+                        data = json.load(cf)
+                        tasks = data.get("tasks", [])
+                        success_count = sum(1 for t in tasks if t.get("status") == "success")
+                        total = len(tasks)
+                        # 如果全部成功，也算翻译完成
+                        if total > 0 and success_count == total:
+                            status = "翻译完成"
+                        else:
+                            status = f"翻译中 ({success_count}/{total})"
+                except:
+                    status = "已提取" # 读取失败回退
+            # 4. 最次：只有提取出的上下文
+            elif os.path.exists(context_path):
                 status = "已提取"
             
             papers.append({
@@ -136,29 +161,37 @@ def save_layout(req: SaveLayoutRequest):
 def get_extract_data(filename: str):
     raw_name = wf.sanitize_filename(filename)
     
-    # 优先去 llm_output 找 (这是 workflow_utils 生成的标准位置)
+    # 1. 尝试读取现有的缓存 (进度优先)
     cache_path = os.path.join(CONFIG["llm_dir"], f"{raw_name}_llm_cache.json")
-    
-    # 备用方案：如果还没生成，尝试去 extracted_output 找 (兼容旧逻辑)
-    if not os.path.exists(cache_path):
-        # 尝试构建临时任务 (如果提取了但没生成JSON)
-        context_path = os.path.join(CONFIG["extract_dir"], f"{raw_name}_context.txt")
-        if os.path.exists(context_path):
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # 返回完整结构，以便前端获取 ref_map
+                return data 
+        except Exception as e:
+            print(f"Cache read error: {e}")
+            # 如果缓存坏了，继续向下尝试重新构建
+            
+    # 2. 如果没有缓存，尝试从 Context 实时构建 (兜底方案)
+    context_path = os.path.join(CONFIG["extract_dir"], f"{raw_name}_context.txt")
+    if os.path.exists(context_path):
+        try:
             with open(context_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            # 实时构建任务列表返回 (不保存文件，仅预览)
-            tasks, _, _ = wf.build_initial_tasks(content)
-            return tasks
-        else:
-            raise HTTPException(404, "Extract data not found (Run Step 1 first)")
+            # 实时构建任务列表 (不保存文件，仅用于前端展示)
+            tasks, ref_map_str, _ = wf.build_initial_tasks(content)
+            # 构造一个临时的兼容对象返回
+            return {
+                "tasks": tasks,
+                "ref_map": ref_map_str,
+                "is_temp": True
+            }
+        except Exception as e:
+            raise HTTPException(500, f"Failed to build from context: {str(e)}")
             
-    try:
-        with open(cache_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            # 返回 tasks 数组
-            return data.get("tasks", [])
-    except Exception as e:
-        raise HTTPException(500, f"Failed to load cache: {str(e)}")
+    # 3. 都没有，说明 Step 1 没跑完
+    raise HTTPException(404, "Data not found. Please run Step 1 Extraction first.")
     
 # --- API: 触发工作流 ---
 def _run_extract_task(pdf_path, extract_dir, vis_dir):
@@ -184,6 +217,39 @@ def trigger_translate(filename: str, background_tasks: BackgroundTasks):
     
     background_tasks.add_task(_run_translate_task, ctx_path, res_path, cache_path)
     return {"status": "started", "msg": "LLM 翻译任务已启动"}
+
+async def event_generator(raw_name):
+    """SSE 生成器：监听 Cache 文件变化并推送"""
+    cache_path = os.path.join(CONFIG["llm_dir"], f"{raw_name}_llm_cache.json")
+    last_mod_time = 0
+    
+    while True:
+        if os.path.exists(cache_path):
+            try:
+                # 检查文件修改时间，有变化才读取
+                current_mod_time = os.path.getmtime(cache_path)
+                if current_mod_time > last_mod_time:
+                    last_mod_time = current_mod_time
+                    with open(cache_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        tasks = data.get("tasks", [])
+                        # 推送 JSON 字符串，格式必须是 'data: ...\n\n'
+                        yield f"data: {json.dumps(tasks)}\n\n"
+                        
+                        # 检查是否全部完成，如果是，发送结束信号
+                        if tasks and all(t.get("status") == "success" for t in tasks):
+                            yield "event: close\ndata: done\n\n"
+                            break
+            except Exception as e:
+                print(f"SSE Error: {e}")
+        
+        # 每 1 秒检查一次文件（这是后端检查，比 HTTP 请求轻量得多）
+        await asyncio.sleep(1)
+
+@app.get("/api/stream/translation/{filename}")
+async def stream_translation_progress(filename: str):
+    raw_name = wf.sanitize_filename(filename)
+    return StreamingResponse(event_generator(raw_name), media_type="text/event-stream")
 
 @app.post("/api/workflow/generate_report/{filename}")
 def generate_report(filename: str):
