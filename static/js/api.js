@@ -42,6 +42,14 @@ export const ApiService = {
     });
   },
 
+  // [新增] 停止翻译接口
+  async stopTranslation(filename) {
+    const res = await fetch(`${API_BASE}/api/workflow/stop/${filename}`, {
+      method: "POST",
+    });
+    return await res.json();
+  },
+
   async generateReport(filename) {
     const res = await fetch(
       `${API_BASE}/api/workflow/generate_report/${filename}`,

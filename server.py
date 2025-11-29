@@ -211,12 +211,23 @@ def _run_translate_task(context_path, result_path, cache_path):
 @app.post("/api/workflow/translate/{filename}")
 def trigger_translate(filename: str, background_tasks: BackgroundTasks):
     raw_name = wf.sanitize_filename(filename)
+    
+    # [新增] 确保清除上次可能遗留的停止标志
+    wf.clear_stop(raw_name)
+    
     ctx_path = os.path.join(CONFIG["extract_dir"], f"{raw_name}_context.txt")
     res_path = os.path.join(CONFIG["llm_dir"], f"{raw_name}_llm_result.txt")
     cache_path = os.path.join(CONFIG["llm_dir"], f"{raw_name}_llm_cache.json")
     
     background_tasks.add_task(_run_translate_task, ctx_path, res_path, cache_path)
     return {"status": "started", "msg": "LLM 翻译任务已启动"}
+
+# 2. [新增] 停止接口
+@app.post("/api/workflow/stop/{filename}")
+def stop_translate(filename: str):
+    raw_name = wf.sanitize_filename(filename)
+    wf.request_stop(raw_name) # 设置标志位
+    return {"status": "success", "msg": "已发送停止信号"}
 
 async def event_generator(raw_name):
     """SSE 生成器：监听 Cache 文件变化并推送"""

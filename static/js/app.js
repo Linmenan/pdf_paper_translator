@@ -694,15 +694,25 @@ createApp({
     },
     // === 翻译流程 ===
     async triggerTranslate() {
-      // 简单的开关逻辑
+      // Logic A: 如果正在翻译 -> 点击即停止
       if (this.isTranslating) {
-        this.closeSSE(); // 停止监听（后端仍在跑，但前端不再更新）
-        this.isTranslating = false;
-        alert("已暂停前端监控（后台任务仍在运行）");
+        if (!confirm("确定要终止后台翻译任务吗？")) return;
+
+        try {
+          // [修改] 调用后端 API 真正停止
+          await ApiService.stopTranslation(this.currentPaper.filename);
+
+          this.closeSSE(); // 断开前端监听
+          this.isTranslating = false; // 更新 UI 状态
+
+          alert("已发送停止信号，后台将在当前段落翻译完成后停止。");
+        } catch (e) {
+          alert("停止失败: " + e.message);
+        }
         return;
       }
 
-      // 检查是否已完成
+      // Logic B: 如果未翻译 -> 点击即开始
       if (
         this.translationTasks.length > 0 &&
         this.translationTasks.every((t) => t.status === "success")
@@ -716,10 +726,7 @@ createApp({
       this.busyMsg = "🚀 翻译任务已启动...";
 
       try {
-        // 1. 告诉后端开始跑 (如果已经在跑，后端通常会继续)
         await ApiService.triggerTranslate(this.currentPaper.filename);
-
-        // 2. 建立 SSE 连接监听进度
         this.startSSE();
       } catch (e) {
         console.error(e);

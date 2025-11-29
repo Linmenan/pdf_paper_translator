@@ -26,6 +26,18 @@ MAX_RETRIES = 3
 # ==============================================================================
 #  基础辅助工具 (Utils) - 必须最先定义
 # ==============================================================================
+STOP_FLAGS = set() # 用于存储被请求停止的任务名
+
+def request_stop(raw_name):
+    """外部调用此函数设置停止标志"""
+    print(f"🛑 [Signal] 收到停止请求: {raw_name}")
+    STOP_FLAGS.add(raw_name)
+
+def clear_stop(raw_name):
+    """任务开始前清除旧的停止标志"""
+    if raw_name in STOP_FLAGS:
+        STOP_FLAGS.remove(raw_name)
+
 def sanitize_filename(filename: str) -> str:
     if not filename: return "untitled"
     name = os.path.splitext(os.path.basename(filename))[0]
@@ -858,8 +870,15 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
             "body": P.SYSTEM_PROMPT_BODY, 
             "asset": P.SYSTEM_PROMPT_ASSET.replace("{ref_map_str}", raw_refs_text) 
         }
-        
+        current_raw_name = os.path.basename(output_path).replace("_llm_result.txt", "")
         for task in current_tasks:
+            # [新增] >>>>>>>>>>>> 停止信号检查 >>>>>>>>>>>>
+            if current_raw_name in STOP_FLAGS:
+                print(f"🛑 [Stop] 检测到停止信号，正在终止任务: {current_raw_name}")
+                # 标记该任务（可选，或者直接保留 pending 供下次继续）
+                # task["status"] = "stopped" 
+                break
+            # [结束] <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             if task["status"] != "pending": continue
             idx = task["id"]
             t_type = task["type"]

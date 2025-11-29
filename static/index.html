@@ -105,7 +105,7 @@
               :class="isTranslating ? 'btn-danger' : 'btn-primary'"
               @click="triggerTranslate"
             >
-              <span v-if="isTranslating">🛑 停止监控 (后台继续)</span>
+              <span v-if="isTranslating">🛑 停止翻译 (Stop Task)</span>
               <span v-if="!isTranslating">{{ translationBtnLabel }}</span>
             </button>
 
