@@ -2,12 +2,16 @@ import { API_BASE } from "./config.js";
 
 export const ApiService = {
   async getPapers() {
-    const res = await fetch(`${API_BASE}/api/papers`);
+    // 列表页通常也要防缓存
+    const res = await fetch(`${API_BASE}/api/papers?t=${Date.now()}`);
     return await res.json();
   },
 
   async getLayout(filename) {
-    const res = await fetch(`${API_BASE}/api/layout/${filename}`);
+    // [修改] 增加时间戳，防止加载旧的布局文件
+    const res = await fetch(
+      `${API_BASE}/api/layout/${filename}?t=${Date.now()}`
+    );
     return await res.json();
   },
 
@@ -31,7 +35,10 @@ export const ApiService = {
   },
 
   async getExtractData(filename) {
-    const res = await fetch(`${API_BASE}/api/extract/${filename}`);
+    // [核心修复] 增加 ?t=Timestamp，强制浏览器忽略缓存，请求最新 JSON
+    const res = await fetch(
+      `${API_BASE}/api/extract/${filename}?t=${Date.now()}`
+    );
     if (!res.ok) throw new Error("Extract data not found");
     return await res.json();
   },
@@ -42,7 +49,7 @@ export const ApiService = {
     });
   },
 
-  // [新增] 停止翻译接口
+  // 停止翻译接口
   async stopTranslation(filename) {
     const res = await fetch(`${API_BASE}/api/workflow/stop/${filename}`, {
       method: "POST",

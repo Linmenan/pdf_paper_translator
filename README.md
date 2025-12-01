@@ -114,10 +114,6 @@ local_paper_translate/
 
 5. 待办事项 (TODO)
 
-[ ] 增加双栏/单栏排版的自动检测选项。
-
-[ ] 优化 Step 2 的空状态引导。
-
 6. 文献状态定义 (Status Definitions)
 
 首页列表中的文献状态逻辑如下：

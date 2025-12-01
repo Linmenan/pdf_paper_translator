@@ -47,6 +47,7 @@ createApp({
       isTooltipLocked: false, // [新增] 锁定状态
       eventSource: null, // [新增] SSE 连接对象
       isTranslating: false,
+      isStopping: false,
     };
   },
   computed: {
@@ -154,7 +155,7 @@ createApp({
       return {
         total: tasks.length,
         chars: tasks.reduce(
-          (acc, cur) => acc + (cur.text ? cur.text.length : 0),
+          (acc, cur) => acc + (cur.src ? cur.src.length : 0),
           0
         ),
       };
@@ -303,7 +304,40 @@ createApp({
       };
       this.loadPageImage();
     },
+    // [新增] 专门用于刷新当前步骤数据的方法
+    async refreshCurrentStepData() {
+      if (!this.currentPaper) return;
 
+      // 刷新 Step 2 数据
+      if (this.step === 2) {
+        // 如果正在翻译中，不要打断，否则可能会导致列表跳变
+        if (this.isTranslating) return;
+
+        try {
+          console.log("🔄 Step 2: 正在刷新任务列表...");
+          const res = await ApiService.getExtractData(
+            this.currentPaper.filename
+          );
+          if (Array.isArray(res)) {
+            this.translationTasks = res;
+          } else {
+            this.translationTasks = res.tasks || [];
+            this.currentRefMap = res.ref_map || "";
+          }
+        } catch (e) {
+          console.warn("自动刷新 Step 2 失败:", e);
+        }
+      }
+      // 刷新 Step 3 数据
+      else if (this.step === 3) {
+        // 重新生成报告链接（加时间戳防缓存）
+        if (this.reportUrl) {
+          console.log("🔄 Step 3: 正在刷新 iframe...");
+          const baseUrl = this.reportUrl.split("?")[0];
+          this.reportUrl = `${baseUrl}?t=${Date.now()}`;
+        }
+      }
+    },
     async loadPageImage() {
       if (!this.currentPaper || !this.editor) return;
       this.selectedItem = null;
@@ -518,10 +552,40 @@ createApp({
     },
     getNextId(type) {
       if (!type) return 1;
-      const items = this.layoutData[String(this.pageIdx)] || [];
-      const existingIds = items.filter((x) => x.type === type).map((x) => x.id);
+
+      // 定义需要全篇扫描的类型 (Global Scope)
+      const globalTypes = ["Figure", "Table", "Equation", "Algorithm"];
+      let existingIds = [];
+
+      if (globalTypes.includes(type)) {
+        // === 全局模式：扫描所有页面收集已用 ID ===
+        // 遍历 layoutData 的所有 key (页码)
+        Object.values(this.layoutData).forEach((pageItems) => {
+          if (Array.isArray(pageItems)) {
+            pageItems.forEach((item) => {
+              if (item.type === type) {
+                existingIds.push(item.id);
+              }
+            });
+          }
+        });
+      } else {
+        // === 局部模式：仅扫描当前页收集已用 ID (原有逻辑) ===
+        // 适用于 Mask, Header, ContentArea 等
+        const items = this.layoutData[String(this.pageIdx)] || [];
+        existingIds = items.filter((x) => x.type === type).map((x) => x.id);
+      }
+
+      // === 核心算法：寻找最小空缺正整数 ===
+      // 1. 转为 Set 去重，提高查找效率
+      const idSet = new Set(existingIds);
+
+      // 2. 从 1 开始尝试，直到找到一个不在 Set 中的数字
       let nextId = 1;
-      while (existingIds.includes(nextId)) nextId++;
+      while (idSet.has(nextId)) {
+        nextId++;
+      }
+
       return nextId;
     },
     createNewId() {
@@ -694,25 +758,17 @@ createApp({
     },
     // === 翻译流程 ===
     async triggerTranslate() {
-      // Logic A: 如果正在翻译 -> 点击即停止
+      // === 场景 A: 正在翻译中，用户想停止 ===
       if (this.isTranslating) {
-        if (!confirm("确定要终止后台翻译任务吗？")) return;
-
-        try {
-          // [修改] 调用后端 API 真正停止
-          await ApiService.stopTranslation(this.currentPaper.filename);
-
-          this.closeSSE(); // 断开前端监听
-          this.isTranslating = false; // 更新 UI 状态
-
-          alert("已发送停止信号，后台将在当前段落翻译完成后停止。");
-        } catch (e) {
-          alert("停止失败: " + e.message);
-        }
+        // 直接调用停止逻辑，不要在这里手动设置 isTranslating = false
+        // 状态的翻转必须等待 stopTranslation -> SSE 的确认
+        await this.stopTranslation();
         return;
       }
 
-      // Logic B: 如果未翻译 -> 点击即开始
+      // === 场景 B: 未翻译，用户想开始 ===
+
+      // 检查是否已全部完成
       if (
         this.translationTasks.length > 0 &&
         this.translationTasks.every((t) => t.status === "success")
@@ -722,7 +778,9 @@ createApp({
         return;
       }
 
+      // 初始化开始状态
       this.isTranslating = true;
+      this.isStopping = false; // 重置停止标记
       this.busyMsg = "🚀 翻译任务已启动...";
 
       try {
@@ -734,37 +792,71 @@ createApp({
         this.isTranslating = false;
       }
     },
+    // [新增] 停止翻译逻辑 (Graceful Stop)
+    async stopTranslation() {
+      if (!confirm("确定要终止后台翻译任务吗？")) return;
+
+      // 1. 标记进入“停止中”阶段
+      this.isStopping = true;
+      // 注意：此时保持 isTranslating = true，按钮显示为“正在停止...”
+
+      try {
+        // 2. 告诉后端停车
+        await ApiService.stopTranslation(this.currentPaper.filename);
+
+        // 3. 【关键】什么都不做！不要断开 SSE！
+        // 我们要死死盯着 SSE，直到后端把那个蓝色的 "processing" 变成橙色的 "pending"
+        // 这个判断逻辑交给 startSSE 去做
+      } catch (e) {
+        alert("发送停止信号失败: " + e.message);
+        this.isStopping = false; // 失败了才回滚状态
+      }
+    },
+
     // [新增] 开启 SSE 连接
     startSSE() {
-      this.closeSSE(); // 防止重复
+      this.closeSSE();
       const url = `${API_BASE}/api/stream/translation/${this.currentPaper.filename}`;
 
       this.eventSource = new EventSource(url);
 
-      // 监听数据推送
       this.eventSource.onmessage = (event) => {
         const tasks = JSON.parse(event.data);
-        this.translationTasks = tasks; // 实时更新界面
+        this.translationTasks = tasks; // 实时刷新界面
+
+        // 检查当前是否有任务是 "processing" (蓝色状态)
+        const hasProcessing = tasks.some((t) => t.status === "processing");
+
+        // === 优雅停止的核心判断 ===
+        // 如果我们处于“停止中 (isStopping)”状态，并且收到的数据里“没有 processing”了
+        // 说明后端已经响应了停止信号，并将状态回滚为 pending 并保存了文件
+        if (this.isStopping && !hasProcessing) {
+          this.closeSSE(); // 1. 安全断开
+          this.isTranslating = false; // 2. 按钮变回“开始”
+          this.isStopping = false; // 3. 退出停止模式
+          this.busyMsg = "";
+          // alert("✅ 任务已停止"); // 可选提示
+          return;
+        }
+
+        // === 正常完成判断 ===
+        const completed = tasks.filter((t) => t.status === "success").length;
+        const total = tasks.length;
+        if (total > 0 && completed === total) {
+          this.closeSSE();
+          this.isTranslating = false;
+          setTimeout(async () => {
+            if (confirm("🎉 翻译完成！是否查看报告？")) {
+              await this.generateReport();
+              this.step = 3;
+            }
+          }, 1000);
+        }
       };
 
-      // 监听结束信号 (我们在 server.py 里定义的 event: close)
-      this.eventSource.addEventListener("close", (e) => {
-        this.closeSSE();
-        this.isTranslating = false;
-
-        // 延迟跳转，提升体验
-        setTimeout(async () => {
-          if (confirm("翻译已完成！是否查看报告？")) {
-            await this.generateReport();
-            this.step = 3;
-          }
-        }, 500);
-      });
-
       this.eventSource.onerror = (err) => {
-        console.warn("SSE 连接断开或出错", err);
-        // SSE 默认会自动重连，如果不需要自动重连可以手动 close
-        // this.closeSSE();
+        // 不做处理，允许 SSE 自动重连
+        // console.warn("SSE 连接波动");
       };
     },
 
@@ -784,12 +876,18 @@ createApp({
     },
   },
   watch: {
-    step(n) {
-      if (n === 1 && this.currentPaper) {
+    step(newStep, oldStep) {
+      // 1. Step 1 初始化逻辑 (原有)
+      if (newStep === 1 && this.currentPaper) {
         nextTick(() => {
           if (!this.editor) this.initEditor();
           else this.editor.resizeCanvasToContainer();
         });
+      }
+
+      // 2. [新增] 切换到 Step 2 或 Step 3 时，强制刷新数据
+      if ((newStep === 2 || newStep === 3) && this.currentPaper) {
+        this.refreshCurrentStepData();
       }
     },
   },

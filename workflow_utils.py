@@ -6,7 +6,7 @@ import platform
 import fitz  # PyMuPDF
 import json
 import hashlib
-import traceback # 新增：用于打印详细报错
+import traceback
 import tkinter as tk
 from tkinter import messagebox, font, ttk
 from PIL import Image, ImageTk, ImageOps
@@ -16,7 +16,7 @@ from functools import partial
 import http.server
 import socketserver
 import webbrowser
-import prompts as P  # 引入新模块
+import prompts as P
 
 # --- 配置常量 ---
 MAX_CHUNK_CHARS = 1000
@@ -202,7 +202,7 @@ def split_text_into_chunks_with_layout(text, max_chars):
     insert_pattern = re.compile(r'\[\[ASSET_INSERT:\s*(.*?)\]\]')
     
     segments = header_pattern.split(text)
-    final_chunks = []
+    final_chunks = []  # [修改] 这里将存储字典 {'text': str, 'type': 'header'|'body'}
     layout_map = {}
     current_chunk_idx = 0
     
@@ -216,7 +216,9 @@ def split_text_into_chunks_with_layout(text, max_chars):
         if not clean_seg and not found_inserts: continue 
         
         if header_pattern.match(seg):
-             final_chunks.append(clean_seg)
+             # [核心修改] 标记为 header 类型
+             final_chunks.append({"text": clean_seg, "type": "header"})
+             
              if found_inserts:
                  if current_chunk_idx not in layout_map: layout_map[current_chunk_idx] = []
                  layout_map[current_chunk_idx].extend(found_inserts)
@@ -235,7 +237,9 @@ def split_text_into_chunks_with_layout(text, max_chars):
                 p = p.strip()
                 if not p: continue
                 if buffer_len + len(p) > max_chars and buffer:
-                    final_chunks.append("\n\n".join(buffer))
+                    # [核心修改] 标记为 body 类型
+                    final_chunks.append({"text": "\n\n".join(buffer), "type": "body"})
+                    
                     if found_inserts:
                          if current_chunk_idx not in layout_map: layout_map[current_chunk_idx] = []
                          layout_map[current_chunk_idx].extend(found_inserts)
@@ -247,7 +251,9 @@ def split_text_into_chunks_with_layout(text, max_chars):
                 buffer_len += len(p)
             
             if buffer:
-                final_chunks.append("\n\n".join(buffer))
+                # [核心修改] 标记为 body 类型
+                final_chunks.append({"text": "\n\n".join(buffer), "type": "body"})
+                
                 if found_inserts:
                      if current_chunk_idx not in layout_map: layout_map[current_chunk_idx] = []
                      layout_map[current_chunk_idx].extend(found_inserts)
@@ -261,6 +267,7 @@ def split_text_into_chunks_with_layout(text, max_chars):
 def build_initial_tasks(content):
     """
     根据文本内容，执行四段式切分并构建初始任务列表。
+    [修改] 增加返回 ref_map_str，以便后续流程使用
     """
     # 1. 预处理：分离 RefMap
     ref_map_str = ""
@@ -283,12 +290,20 @@ def build_initial_tasks(content):
         
     # B. Body
     if body_text:
+        # 这里返回的 body_parts 现在是字典列表了 [{'text':..., 'type':...}, ...]
         body_parts, local_layout_map = split_text_into_chunks_with_layout(body_text, MAX_CHUNK_CHARS)
         offset = len(raw_chunks) 
         
-        for idx, part in enumerate(body_parts):
-            tagged_part = tag_text_elements(part, ref_map_str)
-            raw_chunks.append({"text": tagged_part, "type": "body"})
+        for idx, part_data in enumerate(body_parts):
+            p_text = part_data["text"]
+            p_type = part_data["type"] # 'header' 或 'body'
+            
+            # 只对 Body 进行图表标签处理，Header 一般不需要
+            tagged_part = tag_text_elements(p_text, ref_map_str) if p_type == 'body' else p_text
+            
+            # 直接使用识别出的类型
+            raw_chunks.append({"text": tagged_part, "type": p_type})
+            
             if idx in local_layout_map:
                 layout_map_global[idx + offset] = local_layout_map[idx]
             
@@ -315,7 +330,7 @@ def build_initial_tasks(content):
         }
         current_tasks.append(task_entry)
         
-    return current_tasks, raw_refs_text, layout_map_global
+    return current_tasks, raw_refs_text, layout_map_global, ref_map_str
 
 # ==============================================================================
 # 主流程类与函数 (LayoutEditor, Extract, Analysis)
@@ -691,6 +706,7 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
 
     for p_idx, page in enumerate(doc):
         page_asset_inserts = []
+        page_headers = [] # [新增] 用于存储本页 Header 的位置和文本，用于后续剔除
         page_items = verified_data.get(p_idx, [])
         ignore_rects = []
         content_rect = page.rect 
@@ -703,6 +719,8 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
             elif item['type'] == 'Header':
                 ignore_rects.append(item['rect'])
                 header_text = page.get_text("text", clip=item['rect']).strip().replace('\n', ' ')
+                # [新增] 记录 Header 信息
+                page_headers.append({'rect': item['rect'], 'text': header_text})
                 page_asset_inserts.append({"rect": item['rect'], "text": f"[[HEADER: {header_text}]]", "id": f"Header_{item['id']}" })
             else:
                 ignore_rects.append(item['rect'])
@@ -730,12 +748,31 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
         for b in sorted_text_blocks:
             bbox = fitz.Rect(b[:4])
             text = b[4].strip()
+            
+            # 1. 完全遮罩检查 (Mask, Title, Assets)
             is_masked = False
             for ir in ignore_rects:
                 if is_box_in_rect(bbox, ir, 0.6): 
                     is_masked = True; break
+            
             if not is_masked and text:
-                mixed_blocks.append({"type": "text", "y_sort": bbox.y0 + (0 if bbox.x0 < mid_x else 10000), "text": text})
+                # [新增] 2. Run-in Heading 剔除逻辑
+                # 如果当前文本块与某个 Header 框有交集，且文本以 Header 内容开头，则剔除
+                for ph in page_headers:
+                    # 几何相交检查 (稍微放宽一点容差)
+                    if bbox.intersects(ph['rect']):
+                        h_txt = ph['text']
+                        # 正则匹配：开头是 Header文字 + 可选的标点(—,-,:,.) + 可选空格
+                        # 例如: "Abstract—Reinforcement" -> 去掉 "Abstract—"
+                        pattern = r"^" + re.escape(h_txt) + r"\s*(?:—|–|-|:|.)?\s*"
+                        
+                        # 如果匹配成功，说明正文包含了标题，执行剔除
+                        if re.search(pattern, text, re.IGNORECASE):
+                            # print(f"✂️ [Text Clean] 从正文中剔除重复标题: {h_txt}", flush=True)
+                            text = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
+
+                if text: # 剔除后如果还有剩，才加入
+                    mixed_blocks.append({"type": "text", "y_sort": bbox.y0 + (0 if bbox.x0 < mid_x else 10000), "text": text})
 
         for ins in sorted_inserts:
             bbox = ins['rect']
@@ -775,7 +812,7 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
     vis_final_dir = os.path.join(vis_output_root, clean_name)
     
     # ----------------------------------------------------------------------
-    #  自动生成 Cache JSON (增加大量日志)
+    #  自动生成 Cache JSON (增量更新逻辑)
     # ----------------------------------------------------------------------
     print("⚡ [Auto-Init] 正在生成初始任务列表...", flush=True)
     try:
@@ -783,38 +820,55 @@ def extract_text_and_save_assets_smart(pdf_path: str, raw_text_dir: str, vis_out
         print(f"   [Debug] 原始 raw_text_dir: {raw_text_dir}", flush=True)
         raw_text_dir_clean = os.path.normpath(raw_text_dir)
         abs_raw_dir = os.path.abspath(raw_text_dir_clean)
-        print(f"   [Debug] 绝对路径 abs_raw_dir: {abs_raw_dir}", flush=True)
         
         root_dir = os.path.dirname(abs_raw_dir)
-        print(f"   [Debug] 推算的 root_dir: {root_dir}", flush=True)
-        
         llm_dir = os.path.join(root_dir, "llm_output")
-        print(f"   [Debug] 目标 llm_dir: {llm_dir}", flush=True)
         
         if not os.path.exists(llm_dir):
-            print("   [Debug] llm_dir 不存在，正在创建...", flush=True)
             os.makedirs(llm_dir, exist_ok=True)
         
         cache_path = os.path.join(llm_dir, f"{clean_name}_llm_cache.json")
-        print(f"   [Debug] 最终 cache_path: {cache_path}", flush=True)
         
-        # 2. 任务构建调试
-        print("   [Debug] 正在调用 build_initial_tasks...", flush=True)
+        # 1. 构建全新的任务列表 (基于本次提取的文本)
+        # [关键修正] 将 ref_map_str 一起传入构建，虽然 build_initial_tasks 内部会再次提取，但结构保持一致
         full_content_with_map = f"[[REF_MAP_START]]\n{ref_map_str}\n[[REF_MAP_END]]\n\n{final_content}"
+        new_tasks, refs, layout, ref_map_extracted = build_initial_tasks(full_content_with_map)
         
-        tasks, refs, layout = build_initial_tasks(full_content_with_map)
-        print(f"   [Debug] build_initial_tasks 返回任务数: {len(tasks)}", flush=True)
-        
-        # 3. 保存
-        _save_cache(cache_path, "init", tasks, refs, layout)
-        
-        # 4. 双重确认
+        # ==============================================================================
+        # 2. [新增/核心逻辑] 尝试加载旧缓存进行合并 (Hash 对比)
+        # ==============================================================================
         if os.path.exists(cache_path):
-            print(f"✅ [Success] 初始任务文件已生成: {cache_path}", flush=True)
-        else:
-            print(f"❌ [Error] 文件保存函数执行完毕，但文件依然不存在!", flush=True)
-        # 5. 保存 (传入 ref_map_str)
-        _save_cache(cache_path, "init", tasks, refs, layout, ref_map=ref_map_str) # <--- 修改这里
+            print(f"   [Merge] 检测到已有缓存，正在进行增量合并...", flush=True)
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    old_data = json.load(f)
+                    old_tasks = old_data.get("tasks", [])
+                    
+                # A. 构建旧任务的 Hash 索引 (key=内容的md5, value=任务对象)
+                old_map = {t["chunk_hash"]: t for t in old_tasks}
+                
+                merged_count = 0
+                for t in new_tasks:
+                    h = t["chunk_hash"]
+                    # B. 如果 Hash 匹配 (说明原文没变)，则把旧的翻译结果“搬”过来
+                    if h in old_map:
+                        old_t = old_map[h]
+                        # 仅搬运状态和译文，ID 和 layout 使用新的
+                        t["trans"] = old_t.get("trans", "")
+                        t["status"] = old_t.get("status", "pending")
+                        t["user_hint"] = old_t.get("user_hint", "")
+                        t["old_trans"] = old_t.get("old_trans", "")
+                        merged_count += 1
+                        
+                print(f"   [Merge] 成功保留了 {merged_count}/{len(new_tasks)} 个片段的进度。", flush=True)
+            except Exception as e:
+                print(f"   ⚠️ [Merge Warning] 合并旧缓存失败，将使用全新列表: {e}", flush=True)
+        # ==============================================================================
+
+        # 3. 保存最终结果 (ref_map 使用提取出的正确值)
+        _save_cache(cache_path, "init", new_tasks, refs, layout, ref_map=ref_map_extracted)
+        print(f"✅ [Success] 任务缓存已更新: {cache_path}", flush=True)
+
     except Exception as e:
         print(f"⚠️ [Fatal Error] 无法自动生成任务缓存: {e}", flush=True)
         traceback.print_exc()
@@ -833,8 +887,8 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
     else:
         content = full_text_path_or_content
 
-    # [修改] 直接复用 build_initial_tasks
-    raw_tasks, raw_refs_text, layout_map_global = build_initial_tasks(content)
+    # [关键修正] 接收 4 个返回值，获取正确的 ref_map
+    raw_tasks, raw_refs_text, layout_map_global, real_ref_map_str = build_initial_tasks(content)
     print(f"📋 [阶段一] 任务编排: 总片段 {len(raw_tasks)} 个")
     
     old_tasks_map = {}
@@ -853,7 +907,11 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
         if cached_task:
             task_entry = cached_task
             task_entry["id"] = newTask["id"] 
-            if task_entry.get("status") == "failed": task_entry["status"] = "pending"
+            
+            # [修改] 如果上次卡在 "failed" 或 "processing" (意外中断)，重置为 "pending"
+            if task_entry.get("status") in ["failed", "processing"]: 
+                task_entry["status"] = "pending"
+            
             if "user_hint" not in task_entry: task_entry["user_hint"] = ""
             if "old_trans" not in task_entry: task_entry["old_trans"] = ""
         else:
@@ -865,21 +923,37 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
     if pending_tasks:
         print(f"\n🚀 [阶段二] 开始推理 (待处理: {len(pending_tasks)})...")
         client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        
+        # [关键修正] Asset Prompt 中注入真正的 Ref Map
         PROMPT_MAP = {
             "meta": P.SYSTEM_PROMPT_META,
+            "header": P.SYSTEM_PROMPT_HEADER, # <--- 新增这一行
             "body": P.SYSTEM_PROMPT_BODY, 
-            "asset": P.SYSTEM_PROMPT_ASSET.replace("{ref_map_str}", raw_refs_text) 
+            "asset": P.SYSTEM_PROMPT_ASSET.replace("{ref_map_str}", real_ref_map_str) 
         }
+        
         current_raw_name = os.path.basename(output_path).replace("_llm_result.txt", "")
+        
         for task in current_tasks:
             # [新增] >>>>>>>>>>>> 停止信号检查 >>>>>>>>>>>>
             if current_raw_name in STOP_FLAGS:
                 print(f"🛑 [Stop] 检测到停止信号，正在终止任务: {current_raw_name}")
-                # 标记该任务（可选，或者直接保留 pending 供下次继续）
-                # task["status"] = "stopped" 
+                
+                # 1. 关键：如果当前任务是 processing，回滚为 pending
+                # 这样下次进来或者前端刷新时，它就是待处理状态，而不是卡死在翻译中
+                if task["status"] == "processing":
+                    task["status"] = "pending"
+                
+                # 2. 关键：退出前强制保存一次 Cache，通知前端“我停好了”
+                if cache_path: 
+                    _save_cache(cache_path, MODEL_NORMAL, current_tasks, raw_refs_text, layout_map_global, ref_map=real_ref_map_str)
+                
                 break
             # [结束] <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             if task["status"] != "pending": continue
+            task["status"] = "processing"
+            if cache_path: 
+                _save_cache(cache_path, MODEL_NORMAL, current_tasks, raw_refs_text, layout_map_global, ref_map=real_ref_map_str)
             idx = task["id"]
             t_type = task["type"]
             user_hint = task.get("user_hint", "").strip()
@@ -890,10 +964,32 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
             if is_correction_mode:
                 print(f"   🔥 Part {idx+1} [纠错模式 -> {current_model}] ...", end="", flush=True)
                 sys_prompt = P.SYSTEM_PROMPT_CORRECTION
-                user_content = (f"【原文】:\n{task['src']}\n\n【旧译文(有误)】:\n{old_trans}\n\n【用户指引(最高优先级)】:\n{user_hint}")
+                
+                # [核心增强] 在纠错模式下，显式注入资源映射表和链接规则
+                # 这样 LLM 才能根据你的指令（如“添加链接”）查表找到正确的 ID
+                ref_map_instruction = (
+                    f"\n\n【必须遵守的资源引用规则】\n"
+                    f"如果用户要求添加图表链接，请严格查阅下表，使用 [[LINK:资源ID|原文]] 格式。\n"
+                    f"例如: 原文 'see Fig. 1' -> 译文 '见 [[LINK:Figure_1|图 1]]'。\n"
+                    f"--- Resource Map (ID Mapping) ---\n"
+                    f"{real_ref_map_str}\n"
+                    f"---------------------------------"
+                )
+                
+                user_content = (
+                    f"【原文】:\n{task['src']}\n\n"
+                    f"【旧译文(有误)】:\n{old_trans}\n\n"
+                    f"【用户指引(最高优先级)】:\n{user_hint}\n"
+                    f"{ref_map_instruction}" # <--- 将映射表附在用户输入的最后
+                )
             else:
                 print(f"   ⚡ Part {idx+1} [普通翻译 -> {current_model}] ...", end="", flush=True)
                 sys_prompt = PROMPT_MAP.get(t_type, PROMPT_MAP["body"])
+                # [关键修正] Body Prompt 中如果也需要 Ref Map，也应该进行替换
+                # 假设 body prompt 里也有 {ref_map_str} 占位符
+                if "{ref_map_str}" in sys_prompt:
+                    sys_prompt = sys_prompt.replace("{ref_map_str}", real_ref_map_str)
+                
                 user_content = task['src']
 
             messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}]
@@ -916,8 +1012,10 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
             if not success:
                 task["status"] = "failed"
                 print(" ❌")
+            
+            # [关键修正] 实时保存时，也写入正确的 ref_map
             if cache_path: 
-                _save_cache(cache_path, MODEL_NORMAL, current_tasks, raw_refs_text, layout_map_global)
+                _save_cache(cache_path, MODEL_NORMAL, current_tasks, raw_refs_text, layout_map_global, ref_map=real_ref_map_str)
     else:
         print("\n🎉 所有任务已完成，无需新增推理。")
 
@@ -931,10 +1029,11 @@ def run_smart_analysis(full_text_path_or_content: str, output_path: str, cache_p
     with open(output_path, 'w', encoding='utf-8') as f: 
         f.write(final_body + "\n" + final_refs)
         
+    # [关键修正] 最终保存
     if cache_path: 
-            # 这里如果是 run_analysis，ref_map 可以在上面通过 build_initial_tasks 解析出来，或者简单传空(不影响显示)
-            # 为了严谨，建议保持 data 完整性，但如果暂时不想改动太大，这里可以传 ""，因为提取阶段已经存过了
-            _save_cache(cache_path, MODEL_NORMAL, current_tasks, raw_refs_text, layout_map_global, ref_map=raw_refs_text) # 暂用 raw_refs_text 或传空
+        _save_cache(cache_path, MODEL_NORMAL, current_tasks, raw_refs_text, layout_map_global, ref_map=real_ref_map_str)
+        
+    print("退出智能翻译...")
     return output_path
 
 def generate_html_report(llm_result_path: str, paper_vis_dir: str):
@@ -988,12 +1087,38 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
                 rel_path = copy_asset_image(aid)
                 assets_map[aid] = { "id": aid, "type": "placeholder", "src": "", "trans": "", "path": rel_path }
 
+    # --- 正则自动加链 ---
+    def auto_link_text(text):
+        if not text: return ""
+        def ref_replacer(match):
+            content = match.group(0)
+            nums = re.findall(r'\d+', content)
+            if nums:
+                first_num = nums[0]
+                return f'<a href="#ref-{first_num}" class="ref-link">{content}</a>'
+            return content
+        text = re.sub(r'\[\s*\d+(?:[,\-]\s*\d+)*\s*\]', ref_replacer, text)
+        def fig_replacer(match):
+            prefix = match.group(1); num = match.group(2); target_id = f"Figure_{num}"
+            return f'<a href="#{target_id}" class="fig-link" onclick="highlightAsset(\'{target_id}\'); return false;">{prefix}{num}</a>'
+        text = re.sub(r'(图|Figure|Fig\.)\s*(\d+)', fig_replacer, text, flags=re.IGNORECASE)
+        def tab_replacer(match):
+            prefix = match.group(1); num = match.group(2); target_id = f"Table_{num}"
+            return f'<a href="#{target_id}" class="tab-link" onclick="highlightAsset(\'{target_id}\'); return false;">{prefix}{num}</a>'
+        text = re.sub(r'(表|Table|Tab\.)\s*(\d+)', tab_replacer, text, flags=re.IGNORECASE)
+        def eq_replacer(match):
+            full_str = match.group(0); num = match.group(2); target_id = f"Equation_{num}"
+            return f'<a href="#{target_id}" class="eq-link" onclick="highlightAsset(\'{target_id}\'); return false;">{full_str}</a>'
+        text = re.sub(r'(式|公式|Eq\.|Equation)\s*[\(（]?\s*(\d+)\s*[\)）]?', eq_replacer, text, flags=re.IGNORECASE)
+        return text
+
     def clean_xml_and_headers(text):
         if not text: return ""
         text = re.sub(r'^```xml', '', text).replace('```', '')
         text = re.sub(r'<header>(.*?)</header>', r'<b>\1</b>', text)
         text = text.replace('<p>', '').replace('</p>', '<br>')
         text = re.sub(r'\[\[HEADER:\s*(.*?)\]\]', r'\1', text)
+        text = auto_link_text(text)
         return text
     
     html_meta = "" 
@@ -1015,23 +1140,328 @@ def generate_html_report(llm_result_path: str, paper_vis_dir: str):
     for task in body_tasks:
         task_id = task['id']
         existing_hint = task.get("user_hint", "")
-        hint_class = "has-hint" if existing_hint else ""
-        status_text = f"(状态: {task.get('status')})" if existing_hint else ""
+        # Class 控制逻辑
+        badge_class = "hint-badge has-hint" if existing_hint else "hint-badge"
+        
+        status_text = ""
+        if existing_hint and task.get('status') == 'pending':
+            status_text = " (⏳ 等待重译)"
+        
         layout_assets = layout_map.get(str(task_id), [])
         for aid in layout_assets:
             if aid in assets_map and aid not in placed_assets:
                 html_body += render_asset_html(aid, assets_map[aid])
                 placed_assets.add(aid)
+        
         src_txt = task.get('src', '')
         trans_txt = clean_xml_and_headers(task.get('trans', ''))
-        html_body += f"""<div class="row-container" id="task-{task_id}"><div class="row text-row {hint_class}"><div class="col-src">{src_txt}</div><div class="col-trans">{trans_txt}<div class="hint-badge" style="display: {'block' if existing_hint else 'none'}">💡 上次提示: {existing_hint} {status_text}</div></div></div><div class="feedback-panel" style="display: none;"><div class="feedback-header">🛠️ 人工纠错向导 (Task {task_id})</div><textarea class="feedback-input" placeholder="请输入给 AI 的翻译提示...">{existing_hint}</textarea><div style="margin-top:5px;"><button class="btn btn-primary" style="font-size:0.8em; padding:4px 10px;" onclick="saveFeedback('{task_id}', this)">确认修改并标记</button><span class="status-saved">✅ 保存成功</span></div></div></div>"""
+        
+        html_body += f"""<div class="row-container" id="task-{task_id}"><div class="row text-row"><div class="col-src">{src_txt}</div><div class="col-trans" id="trans-{task_id}">{trans_txt}<div id="badge-{task_id}" class="{badge_class}">💡 上次提示: {existing_hint} {status_text}</div></div></div><div class="feedback-panel" style="display: none;"><div class="feedback-header">🛠️ 人工纠错向导 (Task {task_id})</div><textarea class="feedback-input" placeholder="请输入给 AI 的翻译提示...">{existing_hint}</textarea><div style="margin-top:5px;"><button class="btn btn-primary" style="font-size:0.8em; padding:4px 10px;" onclick="saveFeedback('{task_id}', this)">确认修改并标记</button><span class="status-saved">✅ 保存成功</span></div></div></div>"""
 
     html_refs = ""
     if raw_refs:
+        def ref_anchor_maker(match):
+            num = match.group(1)
+            return f'<br><span id="ref-{num}" class="ref-anchor">[{num}]</span>'
         refs_content = re.sub(r'\[\[HEADER:.*?\]\]', '', raw_refs).strip()
-        html_refs = f'<div class="ref-section"><pre>{refs_content}</pre></div>'
+        refs_content_linked = re.sub(r'\[(\d+)\]', ref_anchor_maker, refs_content)
+        html_refs = f'<div class="ref-section"><h2>参考文献 (References)</h2><div class="ref-content">{refs_content_linked}</div></div>'
 
-    full_html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>{raw_name} - Interactive Mode</title><style>:root {{ --primary: #2c3e50; --accent: #3498db; --bg: #f8f9fa; --border: #e0e0e0; }}body {{ font-family: "Segoe UI", sans-serif; margin: 0; background: var(--bg); padding-bottom: 100px; }}.container {{ max-width: 1200px; margin: 0 auto; background: #fff; box-shadow: 0 0 20px rgba(0,0,0,0.05); }}.meta-section {{ padding: 40px; text-align: center; background: #fff; }}.meta-title-en {{ font-size: 1.8em; color: #2c3e50; font-weight: 700; }}.meta-title-zh {{ font-size: 1.6em; color: #34495e; font-weight: 400; }}.meta-author-en {{ font-style: italic; color: #7f8c8d; }}.meta-author-zh {{ color: #16a085; font-weight: bold; }}.toolbar {{ position: fixed; top: 20px; right: 20px; background: #fff; padding: 10px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border-radius: 8px; z-index: 999; display: flex; gap: 10px; align-items: center; }}.btn {{ padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; transition: 0.2s; }}.btn-primary {{ background: var(--accent); color: #fff; }}.btn-danger {{ background: #e74c3c; color: #fff; }}.btn-success {{ background: #27ae60; color: #fff; }}.btn:disabled {{ background: #ccc; cursor: not-allowed; }}#loading-mask {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255,255,255,0.8); z-index: 2000; display: none; justify-content: center; align-items: center; flex-direction: column; }}.spinner {{ width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }}@keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}.row-container {{ border-bottom: 1px solid var(--border); }}.row {{ display: flex; }}.col-src, .col-trans {{ flex: 1; padding: 20px; }}.col-src {{ border-right: 1px solid var(--border); color: #555; background: #fff; }}body.feedback-mode .row:hover {{ background: #fdfdfd; }}body.feedback-mode .col-trans {{ cursor: pointer; outline: 1px dashed #ccc; }}.feedback-panel {{ background: #f1f8ff; padding: 15px 20px; border-top: 1px solid #d6eaf8; display: none; }}.feedback-header {{ font-weight: bold; color: #2c3e50; margin-bottom: 5px; font-size: 0.9em; }}.feedback-input {{ width: 100%; height: 60px; padding: 8px; border: 1px solid #bdc3c7; border-radius: 4px; font-family: inherit; margin-bottom: 5px; }}.hint-badge {{ margin-top: 10px; padding: 5px 10px; background: #fff3cd; border: 1px solid #ffeeba; color: #856404; font-size: 0.85em; border-radius: 4px; }}.status-saved {{ color: #27ae60; font-weight: bold; margin-left: 10px; display: none; }}.asset-row {{ background: #f4f4f4; padding: 20px; display: block; }}.asset-card {{ background: #fff; max-width: 90%; margin: 0 auto; border-radius: 8px; padding: 10px; text-align: center; }}.asset-img {{ max-width: 100%; }}</style></head><body><div id="loading-mask"><div class="spinner"></div><div style="margin-top: 15px; font-size: 1.2em; color: #555;">正在后台重译并生成报告，请稍候...</div></div><div class="toolbar"><div id="status-text" style="margin-right: 10px; color: #666;">浏览模式</div><button class="btn btn-primary" id="toggle-btn" onclick="toggleFeedbackMode()">进入纠错模式</button><button class="btn btn-success" id="run-btn" onclick="triggerRerun()" style="display:none;">🚀 应用修改并重译</button></div><div class="container">{html_meta}<div class="main-content">{html_body}</div>{html_refs}</div><script>const API_BASE = "";let isFeedbackMode = false;function toggleFeedbackMode() {{ isFeedbackMode = !isFeedbackMode; document.body.classList.toggle('feedback-mode'); const toggleBtn = document.getElementById('toggle-btn'); const runBtn = document.getElementById('run-btn'); const statusText = document.getElementById('status-text'); if (isFeedbackMode) {{ toggleBtn.textContent = "退出纠错模式"; toggleBtn.classList.replace('btn-primary', 'btn-danger'); runBtn.style.display = 'block'; statusText.textContent = "✏️ 点击译文修改，自动保存"; enableClickHandlers(); }} else {{ toggleBtn.textContent = "进入纠错模式"; toggleBtn.classList.replace('btn-danger', 'btn-primary'); runBtn.style.display = 'none'; statusText.textContent = "浏览模式"; disableClickHandlers(); }} }}function enableClickHandlers() {{ const rows = document.querySelectorAll('.row-container'); rows.forEach(row => {{ const transCol = row.querySelector('.col-trans'); if (transCol.getAttribute('data-bound')) return; transCol.setAttribute('data-bound', 'true'); transCol.onclick = () => {{ if (!isFeedbackMode) return; const panel = row.querySelector('.feedback-panel'); const isHidden = (panel.style.display === 'none' || panel.style.display === ''); panel.style.display = isHidden ? 'block' : 'none'; }}; }}); }}function disableClickHandlers() {{ const panels = document.querySelectorAll('.feedback-panel'); panels.forEach(p => p.style.display = 'none'); }}async function saveFeedback(taskId, btnElement) {{ const container = document.getElementById('task-' + taskId); const input = container.querySelector('.feedback-input'); const hint = input.value.trim(); const statusMsg = container.querySelector('.status-saved'); if (!hint) {{ alert("请输入提示"); return; }} const originalText = btnElement.textContent; btnElement.disabled = true; btnElement.textContent = "保存中..."; try {{ const response = await fetch(API_BASE + '/update_task', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ id: taskId, hint: hint }}) }}); const data = await response.json(); if (data.status === 'success') {{ statusMsg.style.display = 'inline'; setTimeout(() => statusMsg.style.display = 'none', 2000); btnElement.textContent = "已保存 (待重译)"; }} else {{ alert("保存失败: " + data.msg); btnElement.textContent = originalText; btnElement.disabled = false; }} }} catch (err) {{ alert("连接错误: " + err); btnElement.textContent = originalText; btnElement.disabled = false; }} }}async function triggerRerun() {{ if (!confirm("确定要重译吗？")) return; const mask = document.getElementById('loading-mask'); mask.style.display = 'flex'; try {{ const response = await fetch(API_BASE + '/trigger_rerun', {{ method: 'POST' }}); const data = await response.json(); if (data.status === 'success') {{ alert(data.msg); location.reload(); }} else {{ alert("失败: " + data.msg); mask.style.display = 'none'; }} }} catch (err) {{ alert("错误: " + err); mask.style.display = 'none'; }} }}</script></body></html>"""
+    # --- [核心修改] CSS 视觉优化 ---
+    full_html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>{raw_name} - Interactive Mode</title><style>
+    :root {{ --primary: #2c3e50; --accent: #3498db; --bg: #f8f9fa; --border: #e0e0e0; --edit-bg: #fff3e0; --edit-border: #ffb74d; --edit-hover: #ffe0b2; }}
+    body {{ font-family: "Segoe UI", sans-serif; margin: 0; background: var(--bg); padding-bottom: 100px; scroll-behavior: smooth; }}
+    .container {{ max-width: 1200px; margin: 0 auto; background: #fff; box-shadow: 0 0 20px rgba(0,0,0,0.05); border: 2px solid transparent; transition: border 0.3s; }}
+    
+    /* === 纠错模式视觉状态 === */
+    /* 1. 容器边框变橙色，提示“正在编辑状态” */
+    body.feedback-mode .container {{ border: 2px solid var(--edit-border); box-shadow: 0 0 30px rgba(255, 166, 0, 0.15); }}
+    
+    /* 2. 只有【译文格子】变色，其他保持白色 */
+    body.feedback-mode .col-trans {{ 
+        cursor: pointer; 
+        background-color: var(--edit-bg) !important; /* 暖黄色背景 */
+        border-left: 2px solid transparent;
+    }}
+    
+    /* 3. 悬停效果加深 */
+    body.feedback-mode .col-trans:hover {{ 
+        background-color: var(--edit-hover) !important; /* 更深的黄色 */
+        border-left: 2px solid #e67e22;
+    }}
+    
+    /* 4. 提示徽章：仅在纠错模式且有内容时显示 */
+    .hint-badge {{ display: none; margin-top: 10px; padding: 5px 10px; background: #fff3cd; border: 1px solid #ffeeba; color: #856404; font-size: 0.85em; border-radius: 4px; }}
+    body.feedback-mode .hint-badge.has-hint {{ display: block !important; animation: slideDown 0.3s; }}
+    
+    .asset-img {{ max-width: 100%; height: auto; display: block; margin: 0 auto; }}
+    .asset-card {{ background: #fff; max-width: 95%; margin: 0 auto; border-radius: 8px; padding: 10px; text-align: center; }}
+    .ref-section {{ padding: 40px; background: #fff; border-top: 2px solid #eee; }}
+    .ref-content {{ font-family: "Times New Roman", serif; color: #444; line-height: 1.6; }}
+    .ref-anchor {{ color: var(--accent); font-weight: bold; }}
+    
+    .meta-section {{ padding: 40px; text-align: center; background: #fff; }}
+    .meta-title-en {{ font-size: 1.8em; color: #2c3e50; font-weight: 700; }}
+    .meta-title-zh {{ font-size: 1.6em; color: #34495e; font-weight: 400; }}
+    .meta-author-en {{ font-style: italic; color: #7f8c8d; }}
+    .meta-author-zh {{ color: #16a085; font-weight: bold; }}
+    
+    .toolbar {{ position: fixed; top: 20px; right: 20px; background: #fff; padding: 10px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border-radius: 8px; z-index: 999; display: flex; gap: 10px; align-items: center; }}
+    .btn {{ padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; transition: 0.2s; }}
+    .btn-primary {{ background: var(--accent); color: #fff; }}
+    .btn-danger {{ background: #e74c3c; color: #fff; }}
+    .btn-success {{ background: #27ae60; color: #fff; }}
+    .btn:disabled {{ background: #ccc; cursor: not-allowed; }}
+    
+    .row-container {{ border-bottom: 1px solid var(--border); }}
+    .row {{ display: flex; }}
+    .col-src, .col-trans {{ flex: 1; padding: 20px; transition: all 0.3s; }}
+    .col-src {{ border-right: 1px solid var(--border); color: #555; background: #fff; }}
+    
+    .feedback-panel {{ background: #f1f8ff; padding: 15px 20px; border-top: 1px solid #d6eaf8; display: none; }}
+    .feedback-header {{ font-weight: bold; color: #2c3e50; margin-bottom: 5px; font-size: 0.9em; }}
+    .feedback-input {{ width: 100%; height: 60px; padding: 8px; border: 1px solid #bdc3c7; border-radius: 4px; font-family: inherit; margin-bottom: 5px; }}
+    .status-saved {{ color: #27ae60; font-weight: bold; margin-left: 10px; display: none; }}
+    .asset-row {{ background: #f4f4f4; padding: 20px; display: block; scroll-margin-top: 80px; transition: background 0.5s; }}
+    
+    a.fig-link, a.tab-link, a.eq-link, a.ref-link {{ color: var(--accent); text-decoration: none; border-bottom: 1px dotted var(--accent); cursor: pointer; }}
+    a.fig-link:hover, a.tab-link:hover {{ background: #eaf6ff; }}
+    
+    @keyframes slideDown {{ from {{ opacity: 0; transform: translateY(-5px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+    @keyframes highlight-pulse {{ 0% {{ background: #fff3cd; }} 100% {{ background: #f4f4f4; }} }}
+    .highlight-asset {{ animation: highlight-pulse 2s ease-out; }}
+    </style></head>
+    <body>
+    
+    <div class="toolbar">
+        <div id="status-text" style="margin-right: 10px; color: #666;">浏览模式</div>
+        <button class="btn btn-primary" id="toggle-btn" onclick="toggleFeedbackMode()">进入纠错模式</button>
+        <button class="btn btn-success" id="run-btn" onclick="triggerRerun()" style="display:none;">🚀 应用修改并重译</button>
+    </div>
+    
+    <div class="container">{html_meta}<div class="main-content">{html_body}</div>{html_refs}</div>
+    
+    <script>
+    const CURRENT_FILENAME = "{raw_name}";
+    let isFeedbackMode = false;
+    let isTranslating = false;
+    let isStopping = false; // [状态] 标记是否正在停止中
+    let eventSource = null;
+
+    function toggleFeedbackMode() {{
+        if (isTranslating || isStopping) return;
+        isFeedbackMode = !isFeedbackMode;
+        document.body.classList.toggle('feedback-mode');
+        updateUI();
+    }}
+
+    function updateUI() {{
+        const toggleBtn = document.getElementById('toggle-btn');
+        const runBtn = document.getElementById('run-btn');
+        const statusText = document.getElementById('status-text');
+        
+        if (isStopping) {{
+            // 1. 停止中状态
+            toggleBtn.style.display = 'none';
+            runBtn.style.display = 'block';
+            runBtn.textContent = "⏳ 正在停止 (Stopping)...";
+            runBtn.className = 'btn btn:disabled';
+            runBtn.onclick = null;
+            statusText.textContent = "正在等待后台保存进度...";
+            disableClickHandlers();
+        }} 
+        else if (isTranslating) {{
+            // 2. 翻译中状态
+            toggleBtn.style.display = 'none';
+            runBtn.style.display = 'block';
+            runBtn.textContent = "🛑 停止重译";
+            runBtn.className = 'btn btn-danger';
+            runBtn.onclick = stopRerun; 
+            // statusText 由 SSE 更新
+            disableClickHandlers();
+        }} 
+        else if (isFeedbackMode) {{
+            // 3. 纠错模式
+            toggleBtn.style.display = 'block';
+            toggleBtn.textContent = "退出纠错模式";
+            toggleBtn.className = 'btn btn-danger';
+            
+            runBtn.style.display = 'block';
+            runBtn.textContent = "🚀 应用修改并重译";
+            runBtn.className = 'btn btn-success';
+            runBtn.onclick = triggerRerun;
+            
+            statusText.textContent = "✏️ 纠错模式：点击黄色区域即可修改";
+            enableClickHandlers();
+        }} 
+        else {{
+            // 4. 浏览模式
+            toggleBtn.style.display = 'block';
+            toggleBtn.textContent = "进入纠错模式";
+            toggleBtn.className = 'btn btn-primary';
+            runBtn.style.display = 'none';
+            statusText.textContent = "浏览模式";
+            disableClickHandlers();
+        }}
+    }}
+
+    function enableClickHandlers() {{
+        const rows = document.querySelectorAll('.row-container');
+        rows.forEach(row => {{
+            const transCol = row.querySelector('.col-trans');
+            if (transCol.getAttribute('data-bound')) return;
+            transCol.setAttribute('data-bound', 'true');
+            transCol.onclick = () => {{
+                if (!isFeedbackMode || isTranslating || isStopping) return;
+                const panel = row.querySelector('.feedback-panel');
+                const isHidden = (panel.style.display === 'none' || panel.style.display === '');
+                panel.style.display = isHidden ? 'block' : 'none';
+            }};
+        }});
+    }}
+
+    function disableClickHandlers() {{
+        const panels = document.querySelectorAll('.feedback-panel');
+        panels.forEach(p => p.style.display = 'none');
+    }}
+
+    // --- [核心逻辑] 开始重译 ---
+    async function triggerRerun() {{
+        if (!confirm("确定要根据您的修改建议重新翻译吗？")) return;
+        isTranslating = true;
+        isStopping = false;
+        updateUI();
+        
+        try {{
+            const response = await fetch('/api/feedback/rerun', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ filename: CURRENT_FILENAME }})
+            }});
+            startSSE();
+        }} catch (err) {{
+            alert("请求错误: " + err);
+            isTranslating = false;
+            updateUI();
+        }}
+    }}
+
+    // --- [核心逻辑] 停止重译 (优雅停止) ---
+    async function stopRerun() {{
+        if(!confirm("确定要终止后台任务吗？")) return;
+        
+        isStopping = true; // 进入停止等待状态
+        updateUI();
+        
+        try {{
+            await fetch('/api/workflow/stop/' + CURRENT_FILENAME, {{ method: 'POST' }});
+            // 注意：此时不断开 SSE，等待后端回滚数据
+        }} catch(e) {{
+            alert("发送停止信号失败: " + e);
+            isStopping = false;
+            updateUI();
+        }}
+    }}
+
+    // --- [核心逻辑] SSE 监听 ---
+    function startSSE() {{
+        if(eventSource) eventSource.close();
+        const url = '/api/stream/translation/' + CURRENT_FILENAME;
+        eventSource = new EventSource(url);
+        
+        eventSource.onmessage = (e) => {{
+            const tasks = JSON.parse(e.data);
+            const statusText = document.getElementById('status-text');
+            
+            const done = tasks.filter(t => t.status === 'success').length;
+            const pending = tasks.filter(t => t.status === 'pending').length;
+            const processing = tasks.filter(t => t.status === 'processing').length;
+            
+            // [Ack-based Stop] 检测到停止信号已生效 (processing归零)
+            if (isStopping && processing === 0) {{
+                eventSource.close();
+                isTranslating = false;
+                isStopping = false;
+                alert("✅ 后台任务已安全停止，进度已保存。");
+                location.reload(); // 刷新以显示回滚后的状态
+                return;
+            }}
+
+            if (isTranslating && !isStopping) {{
+                statusText.textContent = `⏳ 重译中... (剩余: ${{pending}} | 进行中: ${{processing}})`;
+            }}
+        }};
+        
+        eventSource.addEventListener('close', () => {{
+            eventSource.close();
+            isTranslating = false;
+            isStopping = false;
+            const statusText = document.getElementById('status-text');
+            statusText.textContent = "✅ 完成！正在刷新...";
+            setTimeout(() => {{ location.reload(); }}, 1500);
+        }});
+        
+        eventSource.onerror = (err) => {{
+            console.warn("SSE 连线波动", err);
+        }};
+    }}
+
+    async function saveFeedback(taskId, btnElement) {{
+        const container = document.getElementById('task-' + taskId);
+        const input = container.querySelector('.feedback-input');
+        const hint = input.value.trim();
+        const statusMsg = container.querySelector('.status-saved');
+        const badge = document.getElementById('badge-' + taskId);
+        
+        if (!hint) {{ alert("请输入提示"); return; }}
+        
+        const originalText = btnElement.textContent;
+        btnElement.disabled = true;
+        btnElement.textContent = "保存中...";
+        
+        try {{
+            const response = await fetch('/api/feedback/update', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ 
+                    filename: CURRENT_FILENAME,
+                    id: taskId, 
+                    hint: hint 
+                }})
+            }});
+            const data = await response.json();
+            if (data.status === 'success') {{
+                statusMsg.style.display = 'inline';
+                setTimeout(() => statusMsg.style.display = 'none', 2000);
+                btnElement.textContent = "已保存 (待重译)";
+                
+                if(badge) {{
+                    badge.innerHTML = `💡 上次提示: ${{hint}} (⏳ 等待重译)`;
+                    badge.classList.add('has-hint');
+                }}
+            }} else {{
+                alert("保存失败: " + data.msg);
+                btnElement.disabled = false;
+                btnElement.textContent = originalText;
+            }}
+        }} catch (err) {{
+            alert("连接错误: " + err);
+            btnElement.disabled = false;
+            btnElement.textContent = originalText;
+        }}
+    }}
+    
+    function highlightAsset(id) {{
+        const el = document.getElementById(id);
+        if (el) {{
+            el.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+            el.classList.remove('highlight-asset');
+            void el.offsetWidth;
+            el.classList.add('highlight-asset');
+        }}
+    }}
+    </script>
+    </body></html>"""
 
     try:
         with open(html_path, 'w', encoding='utf-8') as f: f.write(full_html)

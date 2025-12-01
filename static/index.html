@@ -104,9 +104,15 @@
               class="btn"
               :class="isTranslating ? 'btn-danger' : 'btn-primary'"
               @click="triggerTranslate"
+              :disabled="isStopping"
             >
-              <span v-if="isTranslating">🛑 停止翻译 (Stop Task)</span>
-              <span v-if="!isTranslating">{{ translationBtnLabel }}</span>
+              <span v-if="isStopping">⏳ 正在停止 (Waiting)...</span>
+              <span v-if="!isStopping && isTranslating"
+                >🛑 停止翻译 (Stop Task)</span
+              >
+              <span v-if="!isStopping && !isTranslating"
+                >{{ translationBtnLabel }}</span
+              >
             </button>
 
             <button
@@ -352,8 +358,13 @@
                       >❌ 失败</span
                     >
                     <span
-                      v-if="task.status !== 'success' && task.status !== 'failed'"
-                      style="color: #999"
+                      v-if="task.status === 'processing'"
+                      style="color: #3498db; font-weight: bold"
+                      >🔄 翻译中...</span
+                    >
+                    <span
+                      v-if="task.status === 'pending'"
+                      style="color: #e67e22"
                       >⏳ 待处理</span
                     >
                   </div>
@@ -372,11 +383,20 @@
 
                   <div class="target-col">
                     <div class="trans-placeholder" v-if="!task.trans">
-                      <span v-if="task.status === 'pending'"
-                        >正在思考中...</span
+                      <span
+                        v-if="task.status === 'processing'"
+                        style="color: #3498db; font-weight: bold"
+                        >🔄 正在翻译中...</span
                       >
-                      <span v-if="task.status !== 'pending'"
-                        >翻译后将显示在此处...</span
+                      <span
+                        v-if="task.status === 'pending'"
+                        style="color: #e67e22"
+                        >⏳ 待处理...</span
+                      >
+                      <span
+                        v-if="task.status === 'failed'"
+                        style="color: #e74c3c"
+                        >❌ 翻译失败，请重试</span
                       >
                     </div>
                     <div v-if="task.trans">{{ task.trans }}</div>
